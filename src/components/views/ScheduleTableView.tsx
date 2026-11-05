@@ -1,0 +1,1148 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { formatScheduleLabel } from "../../utils/schedule";
+import { isNationalHoliday, getNationalHolidayName } from "../../config/holidays";
+import { getTagStyle } from "../../utils/tagColor";
+import type { EditingSlot, RecordItem, ScheduleConflictInfo, ScheduleDayGroup, ScheduleGroup, ScheduleSlotDate } from "../../types/app";
+
+type ScheduleTableViewProps = {
+  loading?: boolean;
+  isJadwalTambahanMenu: boolean;
+  readOnly: boolean;
+  isAdmin?: boolean;
+  activeScheduleDates: ScheduleSlotDate[];
+  activeDayGroups: ScheduleDayGroup[];
+  activeDayStartIndexes: Set<number>;
+  monthScheduleGroups: ScheduleGroup[];
+  conflictEntryIds: Set<string>;
+  conflictDetails?: Map<string, ScheduleConflictInfo>;
+  editingSlot: EditingSlot | null;
+  saving: boolean;
+  onInlineSaveClass: (group: ScheduleGroup, kelas: string, sekolah: string) => Promise<boolean>;
+  onOpenEditClass: (group: ScheduleGroup) => void;
+  onDeleteClass: (group: ScheduleGroup) => void;
+  onMoveClass: (group: ScheduleGroup, direction: -1 | 1) => void;
+  onSelectSlot: (group: ScheduleGroup, slot: ScheduleSlotDate, item?: RecordItem) => void;
+  onOpenClassModal: () => void;
+  mapelRecords?: Record<string, string>[];
+};
+
+export const ScheduleTableView = React.memo(function ScheduleTableView({
+  loading = false,
+  isJadwalTambahanMenu,
+  readOnly,
+  isAdmin = false,
+  activeScheduleDates,
+  activeDayGroups,
+  activeDayStartIndexes,
+  monthScheduleGroups,
+  conflictEntryIds,
+  conflictDetails,
+  editingSlot,
+  saving,
+  onInlineSaveClass,
+  onOpenEditClass,
+  onDeleteClass,
+  onMoveClass,
+  onSelectSlot,
+  onOpenClassModal,
+  mapelRecords,
+}: ScheduleTableViewProps) {
+  const [searchFilter, setSearchFilter] = useState("");
+  const [selectedJenjangFilter, setSelectedJenjangFilter] = useState<string>("all");
+  const [onlyConflictFilter, setOnlyConflictFilter] = useState(false);
+  const [showLegend, setShowLegend] = useState(false);
+  const [hidePastDates, setHidePastDates] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("schedule_hide_past_dates") === "true";
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("schedule_hide_past_dates", String(hidePastDates));
+    } catch {
+      // ignore
+    }
+  }, [hidePastDates]);
+
+  const todayStr = useMemo(() => {
+    const now = new Date();
+    return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  }, []);
+
+  const pastDatesCount = useMemo(() => {
+    return activeScheduleDates.filter((slot) => slot.date < todayStr).length;
+  }, [activeScheduleDates, todayStr]);
+
+  const displayScheduleDates = useMemo(() => {
+    if (!hidePastDates) return activeScheduleDates;
+    return activeScheduleDates.filter((slot) => slot.date >= todayStr);
+  }, [activeScheduleDates, hidePastDates, todayStr]);
+
+  const displayDayStartIndexes = useMemo(() => {
+    if (!isJadwalTambahanMenu && !hidePastDates) {
+      return activeDayStartIndexes;
+    }
+    const set = new Set<number>();
+    let prevDay = "";
+    displayScheduleDates.forEach((slot, idx) => {
+      const currentDay = slot.day || "";
+      if (idx > 0 && currentDay !== prevDay) {
+        set.add(idx);
+      }
+      prevDay = currentDay;
+    });
+    return set;
+  }, [activeDayStartIndexes, displayScheduleDates, hidePastDates, isJadwalTambahanMenu]);
+
+  const mapelLookupMap = useMemo(() => {
+    const map = new Map<string, string>();
+    if (!mapelRecords) return map;
+    mapelRecords.forEach((r) => {
+      const kode = String(r["Kode_Mapel"] || r["Singkatan"] || "").trim();
+      const nama = String(r["Mapel"] || r["Mata Pelajaran"] || "").trim();
+      if (kode) {
+        map.set(kode.toLowerCase(), kode);
+      }
+      if (nama && kode) {
+        map.set(nama.toLowerCase(), kode);
+      }
+    });
+    return map;
+  }, [mapelRecords]);
+
+  const getMapelKode = (rawValue: string) => {
+    const raw = String(rawValue || "").trim();
+    if (!raw) return "";
+    return mapelLookupMap.get(raw.toLowerCase()) || raw;
+  };
+
+  const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+
+  const { totalConflicts, hasVisibleConflict } = useMemo(() => {
+    let count = 0;
+    const visibleDates = new Set(displayScheduleDates.map((s) => s.date));
+    monthScheduleGroups.forEach((group) => {
+      Object.entries(group.entriesByDate).forEach(([dateStr, entryList]) => {
+        if (visibleDates.has(dateStr)) {
+          entryList.forEach((entry) => {
+            if (conflictEntryIds.has(entry.id)) {
+              count++;
+            }
+          });
+        }
+      });
+    });
+    return {
+      totalConflicts: count,
+      hasVisibleConflict: count > 0,
+    };
+  }, [monthScheduleGroups, conflictEntryIds, displayScheduleDates]);
+
+  // Extract available jenjangs for filter
+  const jenjangCounts = useMemo(() => {
+    const counts: Record<string, number> = { all: monthScheduleGroups.length };
+    monthScheduleGroups.forEach((g) => {
+      const j = (g.jenjang || "Lainnya").toUpperCase();
+      counts[j] = (counts[j] || 0) + 1;
+    });
+    return counts;
+  }, [monthScheduleGroups]);
+
+  const availableJenjangs = useMemo(() => {
+    const list = Object.keys(jenjangCounts).filter((k) => k !== "all");
+    return ["all", ...list];
+  }, [jenjangCounts]);
+
+  // Filter groups
+  const filteredGroups = useMemo(() => {
+    const visibleDates = new Set(displayScheduleDates.map((s) => s.date));
+    return monthScheduleGroups.filter((group) => {
+      // Filter by Only Conflict
+      if (onlyConflictFilter) {
+        const hasConflict = Object.entries(group.entriesByDate).some(([dateStr, entries]) =>
+          visibleDates.has(dateStr) && entries.some((e) => conflictEntryIds.has(e.id))
+        );
+        if (!hasConflict) return false;
+      }
+
+      // Filter by Jenjang
+      if (selectedJenjangFilter !== "all") {
+        const j = (group.jenjang || "Lainnya").toUpperCase();
+        if (j !== selectedJenjangFilter) return false;
+      }
+
+      // Filter by Search text
+      if (searchFilter.trim()) {
+        const q = searchFilter.toLowerCase();
+        const matchClass = (group.kelas || "").toLowerCase().includes(q);
+        const matchSekolah = (group.sekolah || "").toLowerCase().includes(q);
+        const matchJenjang = (group.jenjang || "").toLowerCase().includes(q);
+
+        // Check if any schedule entry inside matches mapel or pengajar
+        const matchEntry = Object.entries(group.entriesByDate).some(([dateStr, entries]) =>
+          visibleDates.has(dateStr) &&
+          entries.some(
+            (e) =>
+              (e.mapel || "").toLowerCase().includes(q) ||
+              (e.pengajar || "").toLowerCase().includes(q) ||
+              (e.waktu || "").toLowerCase().includes(q)
+          )
+        );
+
+        if (!matchClass && !matchSekolah && !matchJenjang && !matchEntry) {
+          return false;
+        }
+      }
+
+      return true;
+    });
+  }, [monthScheduleGroups, onlyConflictFilter, selectedJenjangFilter, searchFilter, conflictEntryIds, displayScheduleDates]);
+
+  // Total sessions and teachers count
+  const { totalSessions, totalTeachers } = useMemo(() => {
+    let sessions = 0;
+    const teachers = new Set<string>();
+    const visibleDates = new Set(displayScheduleDates.map((s) => s.date));
+    monthScheduleGroups.forEach((g) => {
+      Object.entries(g.entriesByDate).forEach(([dateStr, entries]) => {
+        if (visibleDates.has(dateStr)) {
+          sessions += entries.length;
+          entries.forEach((e) => {
+            if (e.pengajar && e.pengajar.trim()) {
+              teachers.add(e.pengajar.trim());
+            }
+          });
+        }
+      });
+    });
+    return { totalSessions: sessions, totalTeachers: teachers.size };
+  }, [monthScheduleGroups, displayScheduleDates]);
+
+  // Only reset scroll to top when changing schedule mode or changing target month period
+  const prevPeriodKeyRef = useRef<string>("");
+  useEffect(() => {
+    const currentPeriodKey = isJadwalTambahanMenu
+      ? "jadwalTambahan"
+      : (activeScheduleDates[0]?.date ? activeScheduleDates[0].date.slice(0, 7) : "");
+
+    if (prevPeriodKeyRef.current && prevPeriodKeyRef.current !== currentPeriodKey) {
+      if (scrollContainerRef.current) {
+        scrollContainerRef.current.scrollTop = 0;
+        scrollContainerRef.current.scrollLeft = 0;
+      }
+    }
+    prevPeriodKeyRef.current = currentPeriodKey;
+  }, [isJadwalTambahanMenu, activeScheduleDates]);
+
+  // Reset vertical scroll on search/filter changes
+  useEffect(() => {
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTop = 0;
+    }
+  }, [searchFilter, selectedJenjangFilter, onlyConflictFilter]);
+
+  // Virtualizer for smooth rendering of large schedule datasets
+  const rowVirtualizer = useVirtualizer({
+    count: filteredGroups.length,
+    getScrollElement: () => scrollContainerRef.current,
+    estimateSize: () => 78,
+    overscan: 6,
+  });
+
+  const virtualRows = rowVirtualizer.getVirtualItems();
+  const totalSize = rowVirtualizer.getTotalSize();
+  const paddingTop = virtualRows.length > 0 ? virtualRows[0].start : 0;
+  const paddingBottom =
+    virtualRows.length > 0
+      ? totalSize - virtualRows[virtualRows.length - 1].end
+      : 0;
+
+  return (
+    <div className="schedule-table-module d-flex flex-column gap-3 mt-3">
+      {/* 1. Executive Summary & Control Header */}
+      <div className="card shadow-sm border rounded-3 bg-white">
+        <div className="card-body p-3">
+          <div className="d-flex flex-column flex-lg-row justify-content-between align-items-stretch align-items-lg-center gap-3">
+            {/* Left Info: Mode & Quick KPI Badges */}
+            <div className="d-flex flex-wrap align-items-center gap-2">
+              <div className="d-flex align-items-center gap-2 me-2">
+                <div
+                  className="rounded-3 d-flex align-items-center justify-content-center bg-primary-subtle text-primary"
+                  style={{ width: 36, height: 36 }}
+                >
+                  <i className={`bi ${isJadwalTambahanMenu ? "bi-journal-plus" : "bi-calendar2-range"} fs-5`} />
+                </div>
+                <div>
+                  <h6 className="fw-bold mb-0 text-dark">
+                    {isJadwalTambahanMenu ? "Jadwal Tambahan & Pelayanan" : "Jadwal Reguler KBM"}
+                  </h6>
+                  <div className="text-muted text-xxs">
+                    {isJadwalTambahanMenu ? "Periode 30 hari ke depan" : "Tabel jadwal belajar mengajar bulanan"}
+                  </div>
+                </div>
+              </div>
+
+              {/* KPI Badges */}
+              <div className="d-flex flex-wrap align-items-center gap-1.5 ms-lg-2">
+                <span className="badge bg-light text-dark border px-2.5 py-1.5 rounded-pill d-flex align-items-center gap-1">
+                  <i className="bi bi-mortarboard text-primary" />
+                  <span>Kelas:</span>
+                  <strong className="text-primary">{monthScheduleGroups.length}</strong>
+                </span>
+
+                <span className="badge bg-light text-dark border px-2.5 py-1.5 rounded-pill d-flex align-items-center gap-1">
+                  <i className="bi bi-clock-history text-success" />
+                  <span>Total Sesi:</span>
+                  <strong className="text-success">{totalSessions}</strong>
+                </span>
+
+                <span className="badge bg-light text-dark border px-2.5 py-1.5 rounded-pill d-flex align-items-center gap-1">
+                  <i className="bi bi-people text-info" />
+                  <span>Pengajar:</span>
+                  <strong className="text-info">{totalTeachers}</strong>
+                </span>
+
+                {hasVisibleConflict ? (
+                  <button
+                    type="button"
+                    onClick={() => setOnlyConflictFilter((prev) => !prev)}
+                    className={`badge border px-2.5 py-1.5 rounded-pill d-flex align-items-center gap-1.5 text-decoration-none shadow-xs transition-all ${
+                      onlyConflictFilter
+                        ? "bg-danger text-white border-danger"
+                        : "bg-danger-subtle text-danger border-danger-subtle hover-bg-light"
+                    }`}
+                    style={{ cursor: "pointer" }}
+                    title={onlyConflictFilter ? "Klik untuk menampilkan semua kelas" : "Klik untuk memfilter hanya kelas yang memiliki bentrok"}
+                  >
+                    <i className="bi bi-exclamation-triangle-fill animate-pulse" />
+                    <strong>{totalConflicts} Sesi Bentrok</strong>
+                    <span
+                      className={`badge rounded-pill text-xxs ${
+                        onlyConflictFilter ? "bg-white text-danger" : "bg-danger text-white"
+                      }`}
+                      style={{ fontSize: "8px", padding: "1px 5px" }}
+                    >
+                      {onlyConflictFilter ? "Filter Aktif (Klik Reset)" : "Filter"}
+                    </span>
+                  </button>
+                ) : (
+                  <span className="badge bg-success-subtle text-success border border-success-subtle px-2.5 py-1.5 rounded-pill d-flex align-items-center gap-1">
+                    <i className="bi bi-shield-check" />
+                    <span>Jadwal Aman</span>
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {/* Right Controls: Search, Hide Past Dates Filter, Legend & Add Class Button */}
+            <div className="d-flex flex-wrap align-items-center gap-2">
+              {/* Search Bar */}
+              <div className="input-group input-group-sm" style={{ width: 220 }}>
+                <span className="input-group-text bg-light border-end-0">
+                  <i className="bi bi-search text-muted" />
+                </span>
+                <input
+                  type="text"
+                  className="form-control border-start-0"
+                  placeholder="Cari kelas, mapel, guru..."
+                  value={searchFilter}
+                  onChange={(e) => setSearchFilter(e.target.value)}
+                />
+                {searchFilter && (
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary bg-white border-start-0"
+                    onClick={() => setSearchFilter("")}
+                  >
+                    <i className="bi bi-x" />
+                  </button>
+                )}
+              </div>
+
+              {/* Filter Sembunyikan Jadwal Terlewat */}
+              <button
+                type="button"
+                className={`btn btn-sm d-flex align-items-center gap-1.5 fw-semibold transition-all ${
+                  hidePastDates
+                    ? "btn-primary text-white shadow-xs"
+                    : "btn-outline-secondary bg-white text-secondary"
+                }`}
+                onClick={() => setHidePastDates((prev) => !prev)}
+                title={
+                  hidePastDates
+                    ? "Sedang menyembunyikan jadwal sebelum hari ini. Klik untuk menampilkan semua tanggal."
+                    : "Klik untuk menyembunyikan tanggal jadwal yang sudah terlewat dari hari ini."
+                }
+              >
+                <i className={`bi ${hidePastDates ? "bi-calendar-minus-fill" : "bi-calendar-check"}`} />
+                <span>{hidePastDates ? "Jadwal Terlewat Disembunyikan" : "Sembunyikan Jadwal Terlewat"}</span>
+                {pastDatesCount > 0 && (
+                  <span
+                    className={`badge rounded-pill text-xxs ${
+                      hidePastDates ? "bg-white text-primary" : "bg-light text-muted border"
+                    }`}
+                    style={{ fontSize: "9px" }}
+                  >
+                    {hidePastDates ? `-${pastDatesCount} hari` : `${pastDatesCount} hari lewat`}
+                  </span>
+                )}
+              </button>
+
+              {/* Toggle Legend */}
+              <button
+                type="button"
+                className={`btn btn-sm ${showLegend ? "btn-secondary text-white" : "btn-outline-secondary bg-white"}`}
+                onClick={() => setShowLegend(!showLegend)}
+                title="Tampilkan Panduan Warna"
+              >
+                <i className="bi bi-palette me-1" />
+                Panduan
+              </button>
+
+              {/* Add Class Button */}
+              {!readOnly && (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-primary shadow-sm fw-semibold d-flex align-items-center gap-1 px-3"
+                  onClick={onOpenClassModal}
+                >
+                  <i className="bi bi-plus-circle-fill" />
+                  <span>Tambah Kelas</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Filter Indicators / Chips */}
+          {(availableJenjangs.length > 2 || hidePastDates) && (
+            <div className="d-flex flex-wrap align-items-center gap-2 mt-2.5 pt-2 border-top">
+              {availableJenjangs.length > 2 && (
+                <div className="d-flex flex-wrap align-items-center gap-1.5">
+                  <span className="text-muted text-xxs fw-semibold me-1">Filter Jenjang:</span>
+                  {availableJenjangs.map((j) => {
+                    const isSelected = selectedJenjangFilter === j;
+                    const label = j === "all" ? "Semua Jenjang" : j;
+                    const count = jenjangCounts[j] || 0;
+
+                    return (
+                      <button
+                        key={j}
+                        type="button"
+                        className={`btn btn-sm py-0.5 px-2 rounded-pill text-xxs fw-semibold ${
+                          isSelected
+                            ? "btn-primary shadow-xs"
+                            : "btn-light text-secondary border"
+                        }`}
+                        onClick={() => setSelectedJenjangFilter(j)}
+                      >
+                        {label} <span className="opacity-75">({count})</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {hidePastDates && (
+                <div className="d-flex align-items-center gap-1 ms-auto">
+                  <span className="badge bg-primary-subtle text-primary border border-primary-subtle d-inline-flex align-items-center gap-1 py-1 px-2 rounded-pill text-xxs">
+                    <i className="bi bi-funnel-fill" />
+                    <span>Menyembunyikan tanggal sebelum hari ini</span>
+                    <button
+                      type="button"
+                      className="btn-close btn-close-sm ms-1"
+                      style={{ fontSize: "8px" }}
+                      aria-label="Tutup filter"
+                      onClick={() => setHidePastDates(false)}
+                    />
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Collapsible Color Legend */}
+          {showLegend && (
+            <div className="mt-2.5 p-2.5 bg-light rounded-3 border d-flex flex-wrap align-items-center justify-content-between gap-2 text-xxs">
+              <div className="d-flex flex-wrap align-items-center gap-3">
+                <div className="d-flex align-items-center gap-1.5">
+                  <span
+                    className="d-inline-block rounded shadow-xs"
+                    style={{ width: 14, height: 14, backgroundColor: "#fee2e2", border: "2px solid #ef4444", boxShadow: "0 0 6px rgba(239, 68, 68, 0.4)" }}
+                  />
+                  <span className="fw-semibold text-danger">⚠️ Bentrok Jam Mengajar (Border Merah)</span>
+                </div>
+                <div className="d-flex align-items-center gap-1.5">
+                  <span
+                    className="d-inline-block rounded shadow-xs"
+                    style={{ width: 14, height: 14, backgroundColor: "#fff7ed", border: "2px solid #f97316", boxShadow: "0 0 6px rgba(249, 115, 22, 0.4)" }}
+                  />
+                  <span className="fw-semibold text-warning-emphasis">⚠️ Jeda Cabang &lt; 30 Menit (Border Oranye)</span>
+                </div>
+                <div className="d-flex align-items-center gap-1.5">
+                  <span
+                    className="d-inline-block rounded"
+                    style={{ width: 14, height: 14, backgroundColor: "#fff1f2", border: "1px solid #fda4af" }}
+                  />
+                  <span>Hari Libur Nasional</span>
+                </div>
+                <div className="d-flex align-items-center gap-1.5">
+                  <span
+                    className="d-inline-block rounded"
+                    style={{ width: 14, height: 14, backgroundColor: "#dbeafe", border: "1px solid #3b82f6" }}
+                  />
+                  <span>Kolom Hari Ini / Sel Diedit</span>
+                </div>
+                <div className="d-flex align-items-center gap-1.5">
+                  <span className="badge bg-light text-dark border px-1.5 py-0.5 rounded-pill">(Gabung)</span>
+                  <span>Kelas Digabung</span>
+                </div>
+                <div className="d-flex align-items-center gap-1.5">
+                  <i className="bi bi-lock-fill text-secondary" />
+                  <span>Sesi Hari Ini (Terkunci)</span>
+                </div>
+              </div>
+              <button
+                type="button"
+                className="btn btn-sm btn-link text-muted p-0 text-decoration-none"
+                onClick={() => setShowLegend(false)}
+              >
+                Tutup
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 2. Main Interactive Schedule Table */}
+      {loading && monthScheduleGroups.length === 0 ? (
+        <div className="card border-0 shadow-sm rounded-4 bg-white p-5 text-center my-3">
+          <div
+            className="spinner-border text-primary mx-auto mb-3"
+            style={{ width: 42, height: 42, borderWidth: 3 }}
+            role="status"
+          />
+          <h6 className="fw-bold text-dark mb-1">Memuat Data Jadwal KBM...</h6>
+          <p className="text-muted text-xs mb-0">Menghubungkan ke database server</p>
+        </div>
+      ) : (
+        <div
+          ref={scrollContainerRef}
+          className="table-responsive border rounded-3 bg-white shadow-sm table-sticky-wrapper position-relative"
+        >
+          {loading && (
+            <div
+              className="position-absolute top-0 start-0 w-100 h-100 d-flex align-items-center justify-content-center"
+              style={{
+                backgroundColor: "rgba(255, 255, 255, 0.65)",
+                backdropFilter: "blur(1.5px)",
+                zIndex: 20,
+              }}
+            >
+              <div className="bg-white rounded-pill px-3.5 py-2 shadow-sm border d-flex align-items-center gap-2">
+                <div className="spinner-border spinner-border-sm text-primary" role="status" />
+                <span className="text-xs fw-semibold text-dark">Memperbarui data jadwal...</span>
+              </div>
+            </div>
+          )}
+          <table className="table table-bordered align-middle schedule-table mb-0 table-sticky">
+          <thead className="table-light">
+            <tr>
+              <th className="text-center col-aksi sticky-col-aksi">
+                <div className="py-1 text-uppercase text-xxs fw-bold text-muted">Aksi</div>
+              </th>
+              <th className="text-center col-kelas sticky-col-kelas">
+                <div className="py-1 text-uppercase text-xxs fw-bold text-muted">Kelas</div>
+              </th>
+              {displayScheduleDates.map((slot, index) => {
+                const [year, month, day] = slot.date.split("-").map(Number);
+                const slotDate = new Date(year, month - 1, day);
+                const weekdayFull = slotDate.toLocaleDateString("id-ID", { weekday: "long" });
+                const weekdayShort = slotDate.toLocaleDateString("id-ID", { weekday: "short" });
+                const dateLabel = formatScheduleLabel(slotDate);
+                const holiday = isNationalHoliday(slot.date);
+                const holidayName = holiday ? getNationalHolidayName(slot.date) : null;
+                const isToday = slot.date === todayStr;
+
+                return (
+                  <th
+                    key={slot.date}
+                    className={`text-center schedule-header-cell ${
+                      !isJadwalTambahanMenu && displayDayStartIndexes.has(index) && index !== 0 ? "day-divider" : ""
+                    } ${holiday ? "holiday-col" : ""} ${isToday ? "today-header-col" : ""}`}
+                    title={holidayName ? `Libur Nasional: ${holidayName}` : isToday ? "Hari Ini" : undefined}
+                  >
+                    <div className="d-flex flex-column align-items-center py-1">
+                      <div className="schedule-header-weekday text-nowrap fw-bold">
+                        <span className="d-none d-sm-inline">{weekdayFull}</span>
+                        <span className="d-sm-none">{weekdayShort}</span>
+                      </div>
+                      <div className="d-flex align-items-center gap-1 mt-0.5">
+                        <span
+                          className={`schedule-header-date text-nowrap badge ${
+                            isToday
+                              ? "bg-primary text-white"
+                              : holiday
+                              ? "bg-danger text-white"
+                              : "bg-white text-dark border"
+                          }`}
+                          style={{ fontSize: "10px", padding: "2px 6px" }}
+                        >
+                          {dateLabel}
+                        </span>
+                        {isToday && (
+                          <span
+                            className="badge bg-primary-subtle text-primary border border-primary-subtle text-xxs d-none d-md-inline"
+                            style={{ fontSize: "8px", padding: "1px 4px" }}
+                          >
+                            Hari Ini
+                          </span>
+                        )}
+                        {holiday && (
+                          <i className="bi bi-umbrella-fill text-danger text-xxs" title={holidayName || "Libur"} />
+                        )}
+                      </div>
+                    </div>
+                  </th>
+                );
+              })}
+            </tr>
+          </thead>
+          <tbody>
+            {filteredGroups.length === 0 || displayScheduleDates.length === 0 ? (
+              <tr>
+                <td colSpan={displayScheduleDates.length + 2} className="text-center py-5">
+                  <div className="d-flex flex-column align-items-center justify-content-center p-4">
+                    <div
+                      className="d-flex align-items-center justify-content-center rounded-circle bg-light text-muted mb-3"
+                      style={{ width: 56, height: 56 }}
+                    >
+                      <i className="bi bi-calendar2-x fs-2" />
+                    </div>
+                    <h6 className="fw-bold text-dark mb-1">
+                      {displayScheduleDates.length === 0 && hidePastDates
+                        ? "Semua Jadwal pada Periode Ini Sudah Terlewat"
+                        : onlyConflictFilter
+                        ? "Tidak Ada Jadwal Bentrok pada Filter Ini"
+                        : searchFilter || selectedJenjangFilter !== "all"
+                        ? "Tidak Ada Kelas yang Cocok dengan Filter"
+                        : isJadwalTambahanMenu
+                        ? "Belum Ada Jadwal Tambahan & Pelayanan"
+                        : "Belum Ada Kelas & Jadwal Bulan Ini"}
+                    </h6>
+                    <p className="text-muted small mb-3" style={{ maxWidth: 420 }}>
+                      {displayScheduleDates.length === 0 && hidePastDates
+                        ? "Filter sembunyikan jadwal terlewat sedang aktif, dan seluruh tanggal pada periode ini berada sebelum hari ini."
+                        : onlyConflictFilter
+                        ? "Semua jadwal pada tampilan ini aman dari bentrok antar cabang."
+                        : searchFilter || selectedJenjangFilter !== "all"
+                        ? "Coba sesuaikan kata kunci pencarian atau reset filter jenjang."
+                        : "Klik tombol Tambah Kelas untuk mulai membuat daftar kelas dan mengatur jadwal belajar."}
+                    </p>
+                    {displayScheduleDates.length === 0 && hidePastDates ? (
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-primary px-3 shadow-sm"
+                        onClick={() => setHidePastDates(false)}
+                      >
+                        <i className="bi bi-eye me-1" />
+                        Tampilkan Semua Tanggal
+                      </button>
+                    ) : onlyConflictFilter ? (
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-outline-secondary px-3 shadow-sm"
+                        onClick={() => setOnlyConflictFilter(false)}
+                      >
+                        <i className="bi bi-arrow-counterclockwise me-1" />
+                        Tampilkan Semua Kelas
+                      </button>
+                    ) : !readOnly ? (
+                      <button
+                        type="button"
+                        className="btn btn-sm btn-primary px-3 shadow-sm"
+                        onClick={onOpenClassModal}
+                      >
+                        <i className="bi bi-plus-circle me-1" />
+                        Tambah Kelas Baru
+                      </button>
+                    ) : null}
+                  </div>
+                </td>
+              </tr>
+            ) : (
+              <>
+                {paddingTop > 0 && (
+                  <tr>
+                    <td
+                      colSpan={displayScheduleDates.length + 2}
+                      style={{ height: `${paddingTop}px`, padding: 0, border: 0 }}
+                    />
+                  </tr>
+                )}
+                {virtualRows.map((virtualRow) => {
+                  const group = filteredGroups[virtualRow.index];
+                  const groupIndex = virtualRow.index;
+
+                  return (
+                    <tr
+                      key={`${group.cabang}-${group.kelas}-${group.sekolah || ""}-${groupIndex}`}
+                      ref={rowVirtualizer.measureElement}
+                      data-index={virtualRow.index}
+                    >
+                      {/* Action Column */}
+                      <td className="text-center col-aksi sticky-col-aksi">
+                        {readOnly ? (
+                          <span className="text-muted">-</span>
+                        ) : (
+                          <div className="d-flex flex-column align-items-center justify-content-center gap-1 py-1">
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onMoveClass(group, -1);
+                              }}
+                              className="btn btn-sm p-0 rounded-2 border bg-white text-secondary shadow-xs hover-bg-light"
+                              style={{ width: "26px", height: "24px" }}
+                              aria-label="Geser kelas ke atas"
+                              title="Geser kelas ke atas"
+                              disabled={saving || groupIndex === 0}
+                            >
+                              <i className="bi bi-chevron-up" style={{ fontSize: "12px" }} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onMoveClass(group, 1);
+                              }}
+                              className="btn btn-sm p-0 rounded-2 border bg-white text-secondary shadow-xs hover-bg-light"
+                              style={{ width: "26px", height: "24px" }}
+                              aria-label="Geser kelas ke bawah"
+                              title="Geser kelas ke bawah"
+                              disabled={saving || groupIndex === filteredGroups.length - 1}
+                            >
+                              <i className="bi bi-chevron-down" style={{ fontSize: "12px" }} />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onDeleteClass(group);
+                              }}
+                              className="btn btn-sm p-0 rounded-2 border border-danger-subtle bg-danger-subtle text-danger shadow-xs"
+                              style={{ width: "26px", height: "24px" }}
+                              aria-label="Hapus kelas"
+                              disabled={saving || (!isAdmin && (group.entriesByDate?.[todayStr] ?? []).length > 0)}
+                              title={
+                                saving || (!isAdmin && (group.entriesByDate?.[todayStr] ?? []).length > 0)
+                                  ? "Tidak dapat menghapus kelas yang memiliki jadwal hari ini"
+                                  : "Hapus kelas ini"
+                              }
+                            >
+                              <i className="bi bi-trash" style={{ fontSize: "12px" }} />
+                            </button>
+                          </div>
+                        )}
+                      </td>
+
+                      {/* Class Column */}
+                      <td className="fw-semibold col-kelas sticky-col-kelas">
+                        {!readOnly ? (
+                          <div className="schedule-class-wrapper p-1">
+                            <button
+                              type="button"
+                              className="btn btn-link text-start text-decoration-none text-reset p-0 w-100 class-interactive-card"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                (onOpenEditClass as any)(group);
+                              }}
+                              aria-label="Edit nama kelas"
+                              title="Klik untuk edit kelas / jenjang"
+                            >
+                              <div className="d-flex align-items-center gap-1 mb-1 flex-wrap">
+                                {group.jenjang ? (
+                                  <span className="badge bg-primary-subtle text-primary border border-primary-subtle text-xxs rounded-pill px-2 py-0.5">
+                                    {group.jenjang}
+                                  </span>
+                                ) : null}
+                                {group.classOrder !== undefined && group.classOrder !== null && (
+                                  <span
+                                    className="badge bg-secondary-subtle text-secondary-emphasis border border-secondary-subtle text-xxs rounded-pill px-1.5 py-0.5 font-monospace"
+                                    title={`Urutan Kelas: ${group.classOrder}`}
+                                  >
+                                    #{group.classOrder}
+                                  </span>
+                                )}
+                              </div>
+                              <div className="schedule-class-main fw-bold text-dark d-flex align-items-center justify-content-between">
+                                <span>{group.kelas}</span>
+                                <i className="bi bi-pencil-square text-muted text-xxs class-edit-icon" />
+                              </div>
+                              {isJadwalTambahanMenu && group.sekolah ? (
+                                <div className="schedule-class-sub text-muted small mt-0.5 text-truncate" title={group.sekolah}>
+                                  <i className="bi bi-building me-1" />
+                                  {group.sekolah}
+                                </div>
+                              ) : null}
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="schedule-class-wrapper p-1">
+                            <div className="d-flex align-items-center gap-1 mb-1 flex-wrap">
+                              {group.jenjang ? (
+                                <span className="badge bg-primary-subtle text-primary border border-primary-subtle text-xxs rounded-pill px-2 py-0.5">
+                                  {group.jenjang}
+                                </span>
+                              ) : null}
+                              {group.classOrder !== undefined && group.classOrder !== null && (
+                                <span
+                                  className="badge bg-secondary-subtle text-secondary-emphasis border border-secondary-subtle text-xxs rounded-pill px-1.5 py-0.5 font-monospace"
+                                  title={`Urutan Kelas: ${group.classOrder}`}
+                                >
+                                  #{group.classOrder}
+                                </span>
+                              )}
+                            </div>
+                            <div className="schedule-class-main fw-bold text-dark">{group.kelas}</div>
+                            {isJadwalTambahanMenu && group.sekolah ? (
+                              <div className="schedule-class-sub text-muted small mt-0.5 text-truncate" title={group.sekolah}>
+                                <i className="bi bi-building me-1" />
+                                {group.sekolah}
+                              </div>
+                            ) : null}
+                          </div>
+                        )}
+                      </td>
+
+                      {/* Schedule Slot Cells */}
+                      {displayScheduleDates.map((slot, index) => {
+                        const entries = group.entriesByDate[slot.date] ?? [];
+                        const hasConflictInCell = entries.some((item) => conflictEntryIds.has(item.id));
+                        const cellConflicts = entries
+                          .filter((item) => conflictEntryIds.has(item.id))
+                          .map((item) => conflictDetails?.get(item.id))
+                          .filter(Boolean) as ScheduleConflictInfo[];
+
+                        const hasDirectOverlap = cellConflicts.some((c) => c.type === "overlap");
+                        const hasGapConflict = cellConflicts.some((c) => c.type === "gap");
+                        const isEditingCell =
+                          editingSlot?.cabang === group.cabang &&
+                          editingSlot?.kelas === group.kelas &&
+                          (editingSlot?.sekolah || "") === (group.sekolah || "") &&
+                          editingSlot?.tanggal === slot.date;
+                        const holidayCell = isNationalHoliday(slot.date);
+                        const isToday = slot.date === todayStr;
+
+                        const cellTooltip = !isAdmin && slot.date === todayStr
+                          ? "Terkunci: Tidak dapat menambah/mengubah jadwal hari ini"
+                          : cellConflicts.length > 0
+                          ? `⚠️ PERINGATAN KONFLIK JADWAL:\n${cellConflicts.map((c) => `• ${c.reason}`).join("\n")}\nKlik sel untuk memperbaiki sesi.`
+                          : hasConflictInCell
+                          ? "⚠️ Terdapat jadwal bentrok di sel ini! Klik untuk mengelola/memperbaiki sesi."
+                          : !readOnly
+                          ? "Klik untuk menambah / kelola jadwal sesi ini"
+                          : undefined;
+
+                        return (
+                          <td
+                            key={slot.date}
+                            onClick={() => {
+                              if (!readOnly) {
+                                if (!isAdmin && slot.date === todayStr) {
+                                  window.alert("Tidak diperbolehkan menambah atau mengubah jadwal pada hari ini.");
+                                } else {
+                                  onSelectSlot(group, slot);
+                                }
+                              }
+                            }}
+                            title={cellTooltip}
+                            className={`schedule-cell ${
+                              !isJadwalTambahanMenu && displayDayStartIndexes.has(index) && index !== 0 ? "day-divider" : ""
+                            } ${isEditingCell && !editingSlot?.entryId ? "is-editing" : ""} ${
+                              hasConflictInCell ? (hasDirectOverlap ? "schedule-cell-conflict has-overlap-conflict" : "schedule-cell-conflict has-gap-only") : ""
+                            } ${holidayCell ? "holiday-col" : ""} ${isToday ? "today-cell-col" : ""}`}
+                          >
+                            {hasConflictInCell && (
+                              <div
+                                className="schedule-cell-alert-bar d-flex align-items-center justify-content-center gap-1 mb-1 py-0.5 px-1 rounded text-white shadow-xs"
+                                style={{
+                                  background: hasDirectOverlap
+                                    ? "linear-gradient(135deg, #ef4444 0%, #dc2626 100%)"
+                                    : "linear-gradient(135deg, #ea580c 0%, #c2410c 100%)",
+                                }}
+                                title={cellConflicts.map((c) => c.reason).join("\n") || "Jadwal bentrok pada sel ini"}
+                              >
+                                <i className="bi bi-exclamation-triangle-fill text-xxs animate-pulse" />
+                                <span className="fw-bold" style={{ fontSize: "8px", letterSpacing: "0.3px" }}>
+                                  {hasDirectOverlap ? "BENTROK JAM" : "JEDA CABANG < 30M"}
+                                </span>
+                              </div>
+                            )}
+
+                            {entries.length === 0 ? (
+                              <div className="schedule-empty-slot d-flex align-items-center justify-content-center">
+                                {!readOnly && (isAdmin || !isToday) ? (
+                                  <span className="empty-add-icon text-muted opacity-25">
+                                    <i className="bi bi-plus-lg" />
+                                  </span>
+                                ) : (
+                                  <span className="text-muted text-xxs opacity-50">-</span>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="d-flex flex-column gap-1.5 py-0.5">
+                                {entries.map((item, itemIndex) => {
+                                  const isEditingEntry = editingSlot?.entryId === item.id;
+                                  const rawMapel = item.mapel || `Sesi ${itemIndex + 1}`;
+                                  const displayKode = getMapelKode(rawMapel) || rawMapel;
+                                  const tagStyle = getTagStyle(displayKode, "mapel");
+                                  const isConflict = conflictEntryIds.has(item.id);
+                                  const conflictInfo = conflictDetails?.get(item.id);
+                                  const isGapConflict = conflictInfo?.type === "gap";
+
+                                  return (
+                                    <button
+                                      key={item.id}
+                                      type="button"
+                                      className={`btn text-start p-1.5 schedule-entry-btn rounded-2 shadow-xs ${
+                                        isEditingEntry ? "active" : ""
+                                      } ${
+                                        isConflict
+                                          ? isGapConflict
+                                            ? "is-conflict is-conflict-gap"
+                                            : "is-conflict is-conflict-overlap"
+                                          : ""
+                                      }`}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        if (!readOnly) {
+                                          if (!isAdmin && slot.date === todayStr) {
+                                            window.alert("Tidak diperbolehkan menambah atau mengubah jadwal pada hari ini.");
+                                          } else {
+                                            onSelectSlot(group, slot, item);
+                                          }
+                                        }
+                                      }}
+                                      disabled={readOnly || (!isAdmin && slot.date === todayStr)}
+                                      title={
+                                        !isAdmin && slot.date === todayStr
+                                          ? "Terkunci: Tidak dapat mengubah/hapus jadwal hari ini"
+                                          : isConflict
+                                          ? `⚠️ ${conflictInfo?.label || "BENTROK"}: ${conflictInfo?.reason || `Pengajar ${item.pengajar || ""} bentrok jadwal.`} Klik untuk memperbaiki jadwal!`
+                                          : undefined
+                                      }
+                                    >
+                                      {/* Mapel Header Pill & Conflict Indicator */}
+                                      <div className="d-flex align-items-center justify-content-between gap-1 flex-wrap">
+                                        <span
+                                          className="name-chip fw-bold text-xxs"
+                                          style={{
+                                            ...tagStyle,
+                                            fontSize: "9px",
+                                            padding: "1px 5px",
+                                            maxWidth: "100%",
+                                          }}
+                                        >
+                                          {displayKode}
+                                        </span>
+                                        {isConflict && (
+                                          <span
+                                            className={`badge border d-inline-flex align-items-center gap-0.5 px-1.5 py-0.5 rounded-pill shadow-xs animate-pulse ${
+                                              isGapConflict
+                                                ? "bg-warning text-dark border-warning-subtle"
+                                                : "bg-danger text-white border-danger-subtle"
+                                            }`}
+                                            style={{ fontSize: "7.5px", letterSpacing: "0.2px" }}
+                                            title={conflictInfo?.reason || "Pengajar bentrok pada jam ini! Klik untuk perbaiki."}
+                                          >
+                                            <i
+                                              className={`bi ${
+                                                isGapConflict ? "bi-clock-history" : "bi-exclamation-triangle-fill text-warning"
+                                              }`}
+                                              style={{ fontSize: "7.5px" }}
+                                            />
+                                            <span className="fw-bold">{conflictInfo?.label || (isGapConflict ? "JEDA < 30M" : "BENTROK")}</span>
+                                          </span>
+                                        )}
+                                        {isToday && !isAdmin && !isConflict && (
+                                          <i className="bi bi-lock-fill text-muted text-xxs" title="Terkunci hari ini" />
+                                        )}
+                                      </div>
+
+                                      {/* Gabung Info */}
+                                      {item.isGabung ? (
+                                        <div className="schedule-class-sub text-xxs mt-0.5 text-primary fw-semibold">
+                                          <i className="bi bi-link-45deg me-0.5" />
+                                          Gabung
+                                        </div>
+                                      ) : null}
+
+                                      {/* Pengajar */}
+                                      <div className="mt-1 d-flex align-items-center gap-1">
+                                        {item.pengajar ? (
+                                          <span
+                                            className={`name-chip fw-semibold text-xxs d-inline-flex align-items-center gap-1 ${
+                                              isConflict
+                                                ? isGapConflict
+                                                  ? "border-warning text-warning-emphasis bg-warning-subtle"
+                                                  : "border-danger text-danger bg-danger-subtle"
+                                                : ""
+                                            }`}
+                                            style={{
+                                              ...(!isConflict ? getTagStyle(item.pengajar, "pengajar") : {}),
+                                              fontSize: "9px",
+                                              padding: "1px 5px",
+                                            }}
+                                          >
+                                            {isConflict && (
+                                              <i
+                                                className={`bi ${isGapConflict ? "bi-geo-alt-fill text-warning" : "bi-person-x-fill text-danger"}`}
+                                                style={{ fontSize: "8.5px" }}
+                                              />
+                                            )}
+                                            <span>{item.pengajar}</span>
+                                          </span>
+                                        ) : (
+                                          <span className="text-muted text-xxs">-</span>
+                                        )}
+                                      </div>
+
+                                      {/* Waktu Jam */}
+                                      <div
+                                        className={`text-xxs mt-1 font-monospace d-flex align-items-center justify-content-between gap-1 ${
+                                          isConflict
+                                            ? isGapConflict
+                                              ? "text-warning-emphasis fw-bold"
+                                              : "text-danger fw-bold"
+                                            : "text-muted"
+                                        }`}
+                                      >
+                                        <div className="d-flex align-items-center gap-1">
+                                          <i
+                                            className={`bi ${
+                                              isConflict
+                                                ? isGapConflict
+                                                  ? "bi-clock-history text-warning"
+                                                  : "bi-exclamation-octagon-fill text-danger"
+                                                : "bi-clock text-primary opacity-75"
+                                            }`}
+                                          />
+                                          <span>{item.waktu || "-"}</span>
+                                        </div>
+                                        {isConflict && !readOnly && slot.date !== todayStr && (
+                                          <span
+                                            className={`badge border text-xxs px-1 py-0 ${
+                                              isGapConflict
+                                                ? "bg-warning-subtle text-dark border-warning"
+                                                : "bg-danger-subtle text-danger border-danger-subtle"
+                                            }`}
+                                            title="Klik untuk perbaiki"
+                                          >
+                                            Perbaiki
+                                          </span>
+                                        )}
+                                      </div>
+
+                                      {/* Conflict Reason Ribbon */}
+                                      {isConflict && conflictInfo && (
+                                        <div
+                                          className={`schedule-conflict-note mt-1 text-xxs px-1.5 py-0.5 rounded d-flex align-items-start gap-1 ${
+                                            isGapConflict
+                                              ? "bg-warning-subtle text-dark border border-warning"
+                                              : "bg-danger-subtle text-danger border border-danger-subtle"
+                                          }`}
+                                          style={{ fontSize: "8px", lineHeight: 1.25 }}
+                                          title={conflictInfo.reason}
+                                        >
+                                          <i className="bi bi-info-circle-fill flex-shrink-0 mt-0.5" style={{ fontSize: "8px" }} />
+                                          <span className="text-truncate">
+                                            {isGapConflict
+                                              ? `Jeda <30m dgn ${conflictInfo.otherCabang || "cabang lain"}`
+                                              : `Bentrok dgn ${conflictInfo.otherCabang || "cabang lain"}`}
+                                          </span>
+                                        </div>
+                                      )}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            )}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+                {paddingBottom > 0 && (
+                  <tr>
+                    <td
+                      colSpan={displayScheduleDates.length + 2}
+                      style={{ height: `${paddingBottom}px`, padding: 0, border: 0 }}
+                    />
+                  </tr>
+                )}
+              </>
+            )}
+          </tbody>
+          {!readOnly && filteredGroups.length > 0 && (
+            <tfoot>
+              <tr className="table-light">
+                <td className="col-aksi sticky-col-aksi" />
+                <td className="col-kelas sticky-col-kelas p-2">
+                  <button
+                    type="button"
+                    onClick={onOpenClassModal}
+                    className="btn btn-outline-primary btn-sm w-100 d-flex align-items-center justify-content-center gap-1 py-1 fw-semibold text-xxs"
+                    aria-label="Tambah kelas baru"
+                  >
+                    <i className="bi bi-plus-lg" />
+                    <span>Tambah Kelas</span>
+                  </button>
+                </td>
+                <td colSpan={displayScheduleDates.length} className="text-muted small px-3">
+                  <div className="d-flex align-items-center justify-content-between">
+                    <span>
+                      Total <strong>{filteredGroups.length}</strong> kelas terdaftar
+                    </span>
+                    <span className="text-xxs opacity-75">
+                      💡 Klik pada kolom jam untuk menambah atau mengatur sesi pengajar
+                    </span>
+                  </div>
+                </td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+      )}
+
+      {/* 3. Conflict Alert Banner */}
+      {hasVisibleConflict && (
+        <div className="alert alert-danger shadow-sm border-danger rounded-3 d-flex align-items-center justify-content-between gap-3 p-3 mb-0" role="alert">
+          <div className="d-flex align-items-center gap-3">
+            <div className="rounded-circle bg-danger text-white d-flex align-items-center justify-content-center flex-shrink-0" style={{ width: 36, height: 36 }}>
+              <i className="bi bi-exclamation-triangle-fill fs-5" />
+            </div>
+            <div>
+              <h6 className="fw-bold mb-0 text-danger">Terdeteksi {totalConflicts} Jadwal Bentrok Antar Cabang!</h6>
+              <div className="small text-danger-emphasis mt-0.5">
+                Sesi jadwal dengan bingkai merah bercahaya (*red glow*) menandakan pengajar terjadwal di cabang lain pada jam yang sama. Klik langsung pada sesi bentrok untuk mengubah pengajar atau jam sesi.
+              </div>
+            </div>
+          </div>
+          <button
+            type="button"
+            className={`btn btn-sm text-nowrap fw-semibold ${onlyConflictFilter ? "btn-danger" : "btn-outline-danger"}`}
+            onClick={() => setOnlyConflictFilter(!onlyConflictFilter)}
+          >
+            {onlyConflictFilter ? "Tampilkan Semua Kelas" : "Tampilkan Hanya Bentrok"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+});

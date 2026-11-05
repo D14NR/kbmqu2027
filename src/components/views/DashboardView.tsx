@@ -1,0 +1,1561 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { useInView } from "react-intersection-observer";
+import { formatLocalDate, parseFlexibleDate, parseRangeFromString } from "../../utils/schedule";
+import { getTagStyle } from "../../utils/tagColor";
+import type { DonasiTransaksiRecord, DonasiTransaksiTagihanRecord } from "../../types/donasi";
+
+type DashboardRequestItem = {
+  id: string;
+  kodePengajar: string;
+  namaPengajar: string;
+  cabangPeminta: string;
+  cabangDomisili: string;
+  status: string;
+};
+
+type DashboardScheduleItem = {
+  id: string;
+  tanggal: string;
+  dateKey?: string;
+  timeStart?: number;
+  waktu: string;
+  mapel: string;
+  pengajar: string;
+  kelas: string;
+  cabang: string;
+  sourceLabel: string;
+};
+
+type DashboardIzinItem = {
+  id: string;
+  namaPengajar: string;
+  domisili: string;
+  cabangTarget?: string;
+  tanggalMulai: string;
+  tanggalSelesai: string;
+  keterangan: string;
+  status: string;
+  diputuskanOleh: string;
+  diputuskanPada: string;
+};
+
+type DashboardViewProps = {
+  loading: boolean;
+  pendingRequests: DashboardRequestItem[];
+  dashboardSchedules: DashboardScheduleItem[];
+  izinRequests: DashboardIzinItem[];
+  canManageIzin: boolean;
+  canManagePermintaan: boolean;
+  userCabang?: string;
+  isAdmin?: boolean;
+  transaksiDonasi?: DonasiTransaksiRecord[];
+  tagihanRecords?: DonasiTransaksiTagihanRecord[];
+  onNavigateToDonasi?: () => void;
+  onApproveIzin: (item: DashboardIzinItem) => void;
+  onRejectIzin: (item: DashboardIzinItem) => void;
+  onApprovePermintaan: (item: DashboardRequestItem) => void;
+  onRejectPermintaan: (item: DashboardRequestItem) => void;
+  onDateChange?: (date: string) => void;
+};
+
+const normalizeText = (value: string) => (value || "").trim().toLowerCase();
+
+const getInitials = (name: string) => {
+  if (!name) return "?";
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
+  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+};
+
+const getAvatarBg = (name: string) => {
+  if (!name) return "#4f46e5";
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  const colors = [
+    "#2563eb", // blue
+    "#059669", // emerald
+    "#7c3aed", // violet
+    "#d97706", // amber
+    "#dc2626", // red
+    "#0891b2", // cyan
+    "#4f46e5", // indigo
+    "#db2777", // pink
+  ];
+  return colors[Math.abs(hash) % colors.length];
+};
+
+export const DashboardView = React.memo(function DashboardView(props: DashboardViewProps) {
+  const {
+    loading,
+    pendingRequests,
+    dashboardSchedules,
+    izinRequests,
+    canManageIzin,
+    canManagePermintaan,
+    userCabang = "",
+    isAdmin = false,
+    transaksiDonasi = [],
+    tagihanRecords = [],
+    onNavigateToDonasi,
+    onApproveIzin,
+    onRejectIzin,
+    onApprovePermintaan,
+    onRejectPermintaan,
+    onDateChange,
+  } = props;
+  const todayKey = formatLocalDate(new Date());
+  const tomorrowKey = formatLocalDate(new Date(Date.now() + 86400000));
+
+  const [scheduleMode, setScheduleMode] = useState<"today" | "tomorrow" | "custom">("today");
+  const [customScheduleDate, setCustomScheduleDate] = useState(todayKey);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterType, setFilterType] = useState<"all" | "reguler" | "khusus">("all");
+  const [viewMode, setViewMode] = useState<"cards" | "table">("cards");
+  const [activeApprovalTab, setActiveApprovalTab] = useState<"permintaan" | "izin">("permintaan");
+
+  // Pagination states to prevent heavy DOM rendering and device memory exhaustion
+  const [cardsLimit, setCardsLimit] = useState(18);
+  const [tablePage, setTablePage] = useState(1);
+  const TABLE_PAGE_SIZE = 25;
+
+  const { ref: loadMoreRef, inView } = useInView({
+    threshold: 0,
+    rootMargin: "200px",
+  });
+
+  useEffect(() => {
+    if (inView && viewMode === "cards") {
+      setCardsLimit((prev) => prev + 18);
+    }
+  }, [inView, viewMode]);
+
+  const selectedScheduleKey =
+    scheduleMode === "today"
+      ? todayKey
+      : scheduleMode === "tomorrow"
+      ? tomorrowKey
+      : customScheduleDate;
+
+  // Sync date with parent for on-demand fetching
+  useEffect(() => {
+    if (onDateChange) {
+      onDateChange(selectedScheduleKey);
+    }
+  }, [selectedScheduleKey, onDateChange]);
+
+  // Reset pagination when date or filters change
+  useEffect(() => {
+    setCardsLimit(18);
+    setTablePage(1);
+  }, [selectedScheduleKey, searchQuery, filterType]);
+
+  // Format Indonesian date
+  const formattedFullDate = useMemo(() => {
+    try {
+      const parts = selectedScheduleKey.split("-");
+      if (parts.length === 3) {
+        const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+        return d.toLocaleDateString("id-ID", {
+          weekday: "long",
+          day: "numeric",
+          month: "long",
+          year: "numeric",
+        });
+      }
+    } catch {
+      // fallback
+    }
+    return selectedScheduleKey;
+  }, [selectedScheduleKey]);
+
+  const scheduleLabel =
+    scheduleMode === "today"
+      ? "Hari Ini"
+      : scheduleMode === "tomorrow"
+      ? "Besok"
+      : formattedFullDate;
+
+  // Filter schedules by date (O(1) comparison using precomputed dateKey)
+  const dateSchedules = useMemo(() => {
+    return (dashboardSchedules || []).filter((item) => {
+      if (!(item.pengajar || "").trim()) {
+        return false;
+      }
+      const parsedDate = parseFlexibleDate(item.tanggal || "");
+      const matchesDate = item.dateKey
+        ? item.dateKey === selectedScheduleKey
+        : Boolean(parsedDate && formatLocalDate(parsedDate) === selectedScheduleKey);
+      const matchesBranch = isAdmin || !userCabang || normalizeText(item.cabang) === normalizeText(userCabang);
+      return matchesDate && matchesBranch;
+    });
+  }, [dashboardSchedules, selectedScheduleKey, userCabang, isAdmin]);
+
+  // Filter by search & type
+  const filteredSchedules = useMemo(() => {
+    if (!searchQuery.trim() && filterType === "all") {
+      return dateSchedules;
+    }
+    const qLower = searchQuery.trim().toLowerCase();
+
+    return dateSchedules.filter((item) => {
+      const matchesSearch =
+        !qLower ||
+        (item.pengajar || "").toLowerCase().includes(qLower) ||
+        (item.mapel || "").toLowerCase().includes(qLower) ||
+        (item.kelas || "").toLowerCase().includes(qLower) ||
+        (item.cabang || "").toLowerCase().includes(qLower);
+
+      if (!matchesSearch) return false;
+
+      const sourceLabelLower = (item.sourceLabel || "").toLowerCase();
+      const matchesType =
+        filterType === "all" ||
+        (filterType === "reguler" && sourceLabelLower.includes("reguler")) ||
+        (filterType === "khusus" && (sourceLabelLower.includes("khusus") || sourceLabelLower.includes("tambahan")));
+
+      return matchesType;
+    });
+  }, [dateSchedules, searchQuery, filterType]);
+
+  // Group schedules by teacher (O(1) timeStart comparison without regex in sort)
+  const scheduleGroups = useMemo(() => {
+    const sorted = [...filteredSchedules].sort((a, b) => {
+      const pa = (a.pengajar || "").toLowerCase();
+      const pb = (b.pengajar || "").toLowerCase();
+      if (pa !== pb) return pa.localeCompare(pb);
+      const aStart = a.timeStart ?? (parseRangeFromString(a.waktu || "")?.start ?? Number.MAX_SAFE_INTEGER);
+      const bStart = b.timeStart ?? (parseRangeFromString(b.waktu || "")?.start ?? Number.MAX_SAFE_INTEGER);
+      return aStart - bStart;
+    });
+
+    const groups = new Map<string, typeof sorted>();
+    for (let i = 0; i < sorted.length; i++) {
+      const s = sorted[i];
+      const key = s.pengajar || "(Tanpa Pengajar)";
+      let arr = groups.get(key);
+      if (!arr) {
+        arr = [];
+        groups.set(key, arr);
+      }
+      arr.push(s);
+    }
+    return groups;
+  }, [filteredSchedules]);
+
+  // Chronological list for table view
+  const chronologicalSchedules = useMemo(() => {
+    return [...filteredSchedules].sort((a, b) => {
+      const aStart = a.timeStart ?? (parseRangeFromString(a.waktu || "")?.start ?? Number.MAX_SAFE_INTEGER);
+      const bStart = b.timeStart ?? (parseRangeFromString(b.waktu || "")?.start ?? Number.MAX_SAFE_INTEGER);
+      if (aStart !== bStart) return aStart - bStart;
+      return (a.pengajar || "").localeCompare(b.pengajar || "");
+    });
+  }, [filteredSchedules]);
+
+  // Pending Izin & Permintaan
+  const waitingIzinRequests = useMemo(() => {
+    return (izinRequests || []).filter(
+      (item) => normalizeText(item.status || "Menunggu") === "menunggu"
+    );
+  }, [izinRequests]);
+
+  const showIzinSection = waitingIzinRequests.length > 0;
+  const showPermintaanSection = pendingRequests.length > 0;
+  const hasPendingApprovals = showIzinSection || showPermintaanSection;
+
+  const effectiveApprovalTab =
+    activeApprovalTab === "permintaan" && !showPermintaanSection && showIzinSection
+      ? "izin"
+      : activeApprovalTab === "izin" && !showIzinSection && showPermintaanSection
+      ? "permintaan"
+      : activeApprovalTab;
+
+  // Active Teachers count
+  const uniqueTeachersCount = useMemo(() => {
+    const teacherSet = new Set(dateSchedules.map((s) => (s.pengajar || "").trim()).filter(Boolean));
+    return teacherSet.size;
+  }, [dateSchedules]);
+
+  const greetingText = useMemo(() => {
+    const hour = new Date().getHours();
+    if (hour < 11) return "Selamat Pagi";
+    if (hour < 15) return "Selamat Siang";
+    if (hour < 18) return "Selamat Sore";
+    return "Selamat Malam";
+  }, []);
+
+  // --- Perhitungan Ringkasan Saldo Bersih Bulan Ini (Pusat & Seluruh Cabang) ---
+  // Default tersembunyi, dapat dibuka/ditutup melalui tombol Tampilkan / Sembunyikan
+  const [showFinancialSummary, setShowFinancialSummary] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem("dashboard_show_financial_summary") === "true";
+    } catch {
+      return false;
+    }
+  });
+
+  const handleToggleFinancialSummary = () => {
+    setShowFinancialSummary((prev) => {
+      const next = !prev;
+      try {
+        localStorage.setItem("dashboard_show_financial_summary", String(next));
+      } catch {
+        // ignore storage errors
+      }
+      return next;
+    });
+  };
+
+  const currentMonthKey = formatLocalDate(new Date()).slice(0, 7);
+  const [activeFinancialMonth, setActiveFinancialMonth] = useState<string>(currentMonthKey);
+
+  const activeTransaksiList = transaksiDonasi;
+
+  const getTransactionMonthKey = (dateStr?: string, createdAt?: string): string => {
+    const raw = dateStr || createdAt || "";
+    if (!raw) return "";
+    if (/^\d{4}-\d{2}/.test(raw)) {
+      return raw.slice(0, 7);
+    }
+    try {
+      const d = new Date(raw);
+      if (!isNaN(d.getTime())) {
+        const year = d.getFullYear();
+        const month = String(d.getMonth() + 1).padStart(2, "0");
+        return `${year}-${month}`;
+      }
+    } catch {}
+    const parts = raw.split(/[\/\-]/);
+    if (parts.length === 3 && parts[2].length === 4) {
+      return `${parts[2]}-${parts[1].padStart(2, "0")}`;
+    }
+    return "";
+  };
+
+  const availableFinancialMonths = useMemo(() => {
+    const set = new Set<string>();
+    set.add(currentMonthKey);
+    activeTransaksiList.forEach((t) => {
+      const mKey = getTransactionMonthKey(t.tanggal, t.created_at);
+      if (mKey) set.add(mKey);
+    });
+    return Array.from(set).sort().reverse();
+  }, [activeTransaksiList, currentMonthKey]);
+
+  const currentMonthFormatted = useMemo(() => {
+    try {
+      const parts = activeFinancialMonth.split("-");
+      const d = new Date(Number(parts[0]), Number(parts[1]) - 1, 1);
+      return d.toLocaleDateString("id-ID", { month: "long", year: "numeric" });
+    } catch {
+      return activeFinancialMonth;
+    }
+  }, [activeFinancialMonth]);
+
+  // Transaksi bulan berjalan / terpilih
+  const currentMonthTransaksi = useMemo(() => {
+    return activeTransaksiList.filter((item) => {
+      const mKey = getTransactionMonthKey(item.tanggal, item.created_at);
+      return mKey === activeFinancialMonth;
+    });
+  }, [activeTransaksiList, activeFinancialMonth]);
+
+  // Total Pemasukan Bulan Ini (dijumlahkan dari seluruh donasi/transaksi masuk)
+  const totalPemasukanBulanIni = useMemo(() => {
+    return currentMonthTransaksi.reduce(
+      (sum, item) => sum + (Number(item.jumlah_transaksi_masuk) || 0),
+      0
+    );
+  }, [currentMonthTransaksi]);
+
+  // Total Pengeluaran Bulan Ini (dijumlahkan dari seluruh pengeluaran/tagihan tercatat)
+  const totalPengeluaranBulanIni = useMemo(() => {
+    return currentMonthTransaksi.reduce(
+      (sum, item) => sum + (Number(item.jumlah_transaksi_keluar) || 0),
+      0
+    );
+  }, [currentMonthTransaksi]);
+
+  // Total Saldo Bersih Bulan Ini = Total Pemasukan - Total Pengeluaran
+  const totalSaldoBersihBulanIni = totalPemasukanBulanIni - totalPengeluaranBulanIni;
+
+  // Transaksi sebelum bulan ini untuk menghitung sisa kas bulan lalu / saldo awal
+  const priorMonthTransaksi = useMemo(() => {
+    return activeTransaksiList.filter((item) => {
+      const mKey = getTransactionMonthKey(item.tanggal, item.created_at);
+      return mKey && mKey < activeFinancialMonth;
+    });
+  }, [activeTransaksiList, activeFinancialMonth]);
+
+  const saldoAwalBulanKemarin = useMemo(() => {
+    const masuk = priorMonthTransaksi.reduce((sum, item) => sum + (Number(item.jumlah_transaksi_masuk) || 0), 0);
+    const keluar = priorMonthTransaksi.reduce((sum, item) => sum + (Number(item.jumlah_transaksi_keluar) || 0), 0);
+    return masuk - keluar;
+  }, [priorMonthTransaksi]);
+
+  // Total Kas Tersedia Riil Saat Ini = Sisa Kas Kemarin + Saldo Bersih Bulan Ini
+  const totalKasTersediaSaatIni = saldoAwalBulanKemarin + totalSaldoBersihBulanIni;
+
+  const countPemasukan = useMemo(() => {
+    return currentMonthTransaksi.filter((t) => Number(t.jumlah_transaksi_masuk) > 0).length;
+  }, [currentMonthTransaksi]);
+
+  const countPengeluaran = useMemo(() => {
+    return currentMonthTransaksi.filter((t) => Number(t.jumlah_transaksi_keluar) > 0).length;
+  }, [currentMonthTransaksi]);
+
+  const formatRupiah = (val: number) => {
+    return new Intl.NumberFormat("id-ID", {
+      style: "currency",
+      currency: "IDR",
+      maximumFractionDigits: 0,
+    }).format(val);
+  };
+
+  return (
+    <div className="container-fluid px-0">
+      {/* 1. Header Banner */}
+      <div className="card shadow-sm border rounded-3 mb-3 bg-white">
+        <div className="card-body p-3 p-md-4">
+          <div className="d-flex flex-column flex-md-row justify-content-between align-items-start align-items-md-center gap-3">
+            <div>
+              <div className="d-flex flex-wrap align-items-center gap-2 mb-1">
+                <span className="badge bg-primary text-white px-2 py-1 rounded-pill">
+                  <i className="bi bi-speedometer2 me-1" />
+                  Dashboard Monitoring
+                </span>
+                {userCabang && (
+                  <span className="badge bg-light text-dark border px-2 py-1 rounded-pill">
+                    <i className="bi bi-geo-alt me-1 text-primary" />
+                    Cabang: {userCabang}
+                  </span>
+                )}
+                {isAdmin && (
+                  <span className="badge bg-danger-subtle text-danger border border-danger-subtle px-2 py-1 rounded-pill">
+                    <i className="bi bi-shield-lock me-1" />
+                    Administrator
+                  </span>
+                )}
+              </div>
+              <h4 className="fw-bold mb-1 text-dark">
+                {greetingText}, Monitoring KBM-Qu
+              </h4>
+              <div className="text-muted small">
+                Ikhtisar operasional kegiatan belajar mengajar, ketersediaan pengajar, dan persetujuan cabang.
+              </div>
+            </div>
+
+            {/* Date Select Button Group */}
+            <div className="d-flex flex-column flex-sm-row align-items-stretch align-items-sm-center gap-2 bg-light p-1.5 rounded-3 border">
+              <div className="btn-group btn-group-sm" role="group">
+                <button
+                  type="button"
+                  className={`btn ${scheduleMode === "today" ? "btn-primary shadow-sm fw-bold" : "btn-light text-secondary"}`}
+                  onClick={() => setScheduleMode("today")}
+                >
+                  Hari Ini
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${scheduleMode === "tomorrow" ? "btn-primary shadow-sm fw-bold" : "btn-light text-secondary"}`}
+                  onClick={() => setScheduleMode("tomorrow")}
+                >
+                  Besok
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${scheduleMode === "custom" ? "btn-primary shadow-sm fw-bold" : "btn-light text-secondary"}`}
+                  onClick={() => setScheduleMode("custom")}
+                >
+                  Pilih Tanggal
+                </button>
+              </div>
+
+              {scheduleMode === "custom" && (
+                <input
+                  type="date"
+                  className="form-control form-control-sm"
+                  value={customScheduleDate}
+                  onChange={(e) => setCustomScheduleDate(e.target.value)}
+                  style={{ width: 145 }}
+                />
+              )}
+            </div>
+          </div>
+
+          <div className="mt-3 pt-2 border-top d-flex flex-wrap align-items-center justify-content-between small text-muted gap-2">
+            <div>
+              <i className="bi bi-calendar3 text-primary me-1" />
+              Jadwal Aktif: <strong className="text-dark">{formattedFullDate}</strong>
+            </div>
+            <div className="d-flex gap-3">
+              <span>Total: <strong className="text-primary">{dateSchedules.length} Sesi</strong></span>
+              <span>•</span>
+              <span>Pengajar: <strong className="text-success">{uniqueTeachersCount} Orang</strong></span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 1.5 Banner Donasi (Muncul jika ada tagihan belum lunas) */}
+      {tagihanRecords.some((t) => Number(t.is_lunas) === 0) && (
+        <div className="card border-0 shadow-sm mb-3 overflow-hidden bg-gradient-to-r from-blue-600 to-indigo-700 text-white rounded-3">
+          <div className="card-body p-4 relative">
+            <div className="d-flex flex-column flex-md-row align-items-center justify-content-between gap-4">
+              <div className="d-flex align-items-center gap-4">
+                <div className="bg-white/20 p-3 rounded-circle backdrop-blur-sm border border-white/30 flex-shrink-0">
+                  <i className="bi bi-megaphone-fill fs-3" />
+                </div>
+                <div>
+                  <h4 className="fw-bold mb-1">Dukung Operasional KBM-Qu</h4>
+                  <p className="mb-0 text-white/90">
+                    Terdapat tagihan operasional/server yang belum terpenuhi. Donasi Anda sangat berarti untuk kelancaran kegiatan belajar mengajar kita.
+                  </p>
+                  <div className="mt-2 d-flex flex-wrap gap-2">
+                    {tagihanRecords
+                      .filter((t) => Number(t.is_lunas) === 0)
+                      .slice(0, 2)
+                      .map((t) => (
+                        <span key={t.id} className="badge bg-white/10 border border-white/20 px-2 py-1 text-xxs">
+                          <i className="bi bi-receipt me-1" />
+                          {t.keterangan}: {formatRupiah(t.jumlah_tagihan)}
+                        </span>
+                      ))}
+                    {tagihanRecords.filter((t) => Number(t.is_lunas) === 0).length > 2 && (
+                      <span className="badge bg-white/10 border border-white/20 px-2 py-1 text-xxs">
+                        + {tagihanRecords.filter((t) => Number(t.is_lunas) === 0).length - 2} Lainnya
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={onNavigateToDonasi}
+                className="btn btn-light btn-lg fw-bold px-4 py-2.5 shadow-lg hover:scale-105 transition-transform"
+              >
+                <i className="bi bi-heart-fill text-danger me-2" />
+                Donasi Sekarang
+              </button>
+            </div>
+            {/* Decorative background shape */}
+            <div className="absolute top-0 right-0 -mt-8 -mr-8 w-32 h-32 bg-white/10 rounded-circle blur-3xl" />
+          </div>
+        </div>
+      )}
+
+      {/* 2. Alert Notification Banner (Jika ada persetujuan yang menunggu) */}
+      {hasPendingApprovals && (
+        <div className="alert alert-warning border-warning border-2 d-flex flex-column flex-md-row align-items-start align-items-md-center justify-content-between p-3 mb-3 rounded-3 shadow-sm gap-3">
+          <div className="d-flex align-items-center gap-3">
+            <div
+              className="p-2 bg-warning rounded-circle text-dark d-flex align-items-center justify-content-center flex-shrink-0 shadow-sm"
+              style={{ width: 42, height: 42 }}
+            >
+              <i className="bi bi-bell-fill fs-5" />
+            </div>
+            <div>
+              <h6 className="fw-bold mb-0 text-dark d-flex align-items-center gap-2">
+                Peringatan: Terdapat {waitingIzinRequests.length + pendingRequests.length} Pengajuan Menunggu Persetujuan!
+                <span className="badge bg-danger text-white rounded-pill px-2 py-0.5 text-xxs">
+                  Butuh Tindakan
+                </span>
+              </h6>
+              <div className="small text-dark-emphasis mt-0.5">
+                {waitingIzinRequests.length > 0 && <span><strong>{waitingIzinRequests.length}</strong> Izin Pengajar</span>}
+                {waitingIzinRequests.length > 0 && pendingRequests.length > 0 && <span> dan </span>}
+                {pendingRequests.length > 0 && <span><strong>{pendingRequests.length}</strong> Permintaan Pengajar Antar Cabang</span>}
+                {" "}memerlukan verifikasi / persetujuan cabang Anda.
+              </div>
+            </div>
+          </div>
+          <a
+            href="#approval-section"
+            className="btn btn-warning btn-sm fw-bold text-dark px-3 py-1.5 text-nowrap shadow-sm"
+          >
+            <i className="bi bi-arrow-down-circle me-1.5" />
+            Tinjau Persetujuan Sekarang
+          </a>
+        </div>
+      )}
+
+      {/* 2.5 Kartu Ringkasan Saldo Bersih Bulan Ini (Dengan Tombol Tampilkan / Sembunyikan) */}
+      {!showFinancialSummary ? (
+        <div className="card shadow-xs border border-primary-subtle rounded-3 mb-3 bg-light bg-opacity-60">
+          <div className="card-body py-2.5 px-3 d-flex flex-wrap align-items-center justify-content-between gap-2">
+            <div className="d-flex align-items-center gap-2.5">
+              <div
+                className="rounded-circle bg-primary-subtle text-primary d-flex align-items-center justify-content-center shadow-xs flex-shrink-0"
+                style={{ width: 34, height: 34 }}
+              >
+                <i className="bi bi-wallet2 fs-6 text-primary" />
+              </div>
+              <div>
+                <div className="d-flex align-items-center gap-2 flex-wrap">
+                  <span className="fw-bold text-dark text-sm">
+                    Ringkasan Saldo Bersih & Kas Operasional
+                  </span>
+                  <span className="badge bg-secondary-subtle text-secondary border rounded-pill px-2 py-0.5 text-xxs fw-medium">
+                    <i className="bi bi-eye-slash me-1" />
+                    Tersembunyi
+                  </span>
+                  <span className="badge bg-primary-subtle text-primary rounded-pill px-2 py-0.5 text-xxs fw-semibold">
+                    {userCabang ? `Cabang ${userCabang.toUpperCase()}` : "Pusat & Seluruh Cabang"}
+                  </span>
+                </div>
+                <p className="text-muted text-xxs mb-0 mt-0.5">
+                  Klik tombol <strong>Tampilkan</strong> di sebelah kanan untuk melihat rincian sisa kas, penerimaan donasi, dan tagihan server.
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleToggleFinancialSummary}
+              className="btn btn-primary btn-sm px-3 py-1.5 rounded-pill fw-semibold shadow-xs d-flex align-items-center gap-1.5 text-xs text-nowrap"
+            >
+              <i className="bi bi-eye" />
+              <span>Tampilkan</span>
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="card shadow-sm border border-primary-subtle rounded-3 mb-3 bg-white overflow-hidden">
+          {/* Header Kartu */}
+          <div className="card-header bg-primary-subtle bg-opacity-25 py-2.5 px-3 border-bottom d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <div className="d-flex align-items-center flex-wrap gap-2">
+              <span className="badge bg-primary text-white rounded-pill px-2.5 py-1 text-xxs fw-bold shadow-xs">
+                <i className="bi bi-building me-1" />
+                {userCabang ? `PUSAT & CABANG ${userCabang.toUpperCase()}` : "PUSAT & SELURUH CABANG"}
+              </span>
+              <span className="badge bg-white text-primary border border-primary-subtle rounded-pill px-2.5 py-1 text-xxs fw-semibold">
+                <i className="bi bi-calendar-check me-1" />
+                Bulan Ini ({currentMonthFormatted})
+              </span>
+              <h6 className="fw-bold mb-0 text-dark d-flex align-items-center gap-2 ms-1">
+                <i className="bi bi-cash-stack text-success fs-5" />
+                Ringkasan Saldo Bersih Bulan Ini
+              </h6>
+            </div>
+
+            <div className="d-flex align-items-center gap-2">
+              {availableFinancialMonths.length > 1 && (
+                <div className="d-flex align-items-center gap-1.5">
+                  <span className="text-muted text-xxs fw-medium">Pilih Periode:</span>
+                  <select
+                    className="form-select form-select-sm py-0.5 px-2 text-xs rounded-pill border-secondary-subtle"
+                    style={{ width: "auto" }}
+                    value={activeFinancialMonth}
+                    onChange={(e) => setActiveFinancialMonth(e.target.value)}
+                  >
+                    {availableFinancialMonths.map((m) => {
+                      const isCurrent = m === currentMonthKey;
+                      let label = m;
+                      try {
+                        const [y, mon] = m.split("-");
+                        label = new Date(Number(y), Number(mon) - 1, 1).toLocaleDateString("id-ID", {
+                          month: "long",
+                          year: "numeric",
+                        });
+                      } catch {}
+                      return (
+                        <option key={m} value={m}>
+                          {label} {isCurrent ? "(Bulan Ini)" : ""}
+                        </option>
+                      );
+                    })}
+                  </select>
+                </div>
+              )}
+              {onNavigateToDonasi && (
+                <button
+                  type="button"
+                  onClick={onNavigateToDonasi}
+                  className="btn btn-outline-primary btn-sm rounded-pill px-2.5 py-0.5 text-xxs fw-bold d-flex align-items-center gap-1 shadow-xs"
+                  title="Buka menu Kelola Donasi untuk melihat rincian mutasi & invoice"
+                >
+                  <span>Buka Mutasi Donasi</span>
+                  <i className="bi bi-arrow-right" />
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={handleToggleFinancialSummary}
+                className="btn btn-outline-secondary btn-sm rounded-pill px-2.5 py-0.5 text-xxs fw-semibold d-flex align-items-center gap-1 shadow-xs bg-white"
+                title="Sembunyikan ringkasan saldo"
+              >
+                <i className="bi bi-eye-slash" />
+                <span>Sembunyikan</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Isi Ringkasan Kartu */}
+          <div className="card-body p-3 p-md-3.5">
+            <div className="row g-3">
+              {/* Kolom 1: Total Kas Tersedia Riil (Hero Metric) */}
+              <div className="col-12 col-md-6 col-xl-4">
+                <div
+                  className={`p-3 rounded-3 h-100 border d-flex flex-column justify-content-between ${
+                    totalKasTersediaSaatIni >= 0
+                      ? "bg-success-subtle bg-opacity-25 border-success-subtle"
+                      : "bg-danger-subtle bg-opacity-25 border-danger-subtle"
+                  }`}
+                >
+                  <div>
+                    <div className="d-flex align-items-center justify-content-between mb-1.5">
+                      <span className="text-muted fw-bold text-xxs text-uppercase tracking-wider">
+                        Total Kas Tersedia (Saldo Akhir)
+                      </span>
+                      <span
+                        className={`badge rounded-pill px-2 py-0.5 text-xxs fw-bold ${
+                          totalKasTersediaSaatIni >= 0
+                            ? "bg-success text-white"
+                            : "bg-danger text-white"
+                        }`}
+                      >
+                        {totalKasTersediaSaatIni >= 0 ? "KAS AMAN & TERSISA" : "DEFISIT TOTAL"}
+                      </span>
+                    </div>
+                    <div
+                      className={`fw-bolder tracking-tight ${
+                        totalKasTersediaSaatIni >= 0 ? "text-success" : "text-danger"
+                      }`}
+                      style={{ fontSize: "1.75rem", lineHeight: 1.2 }}
+                    >
+                      {formatRupiah(totalKasTersediaSaatIni)}
+                    </div>
+                    <div className="text-muted text-xxs mt-1">
+                      {totalKasTersediaSaatIni >= 0
+                        ? "Uang kas riil yang aman & siap digunakan (sudah digabung sisa bulan lalu)."
+                        : "Seluruh kas habis dan membutuhkan donasi tambahan untuk operasional."}
+                    </div>
+                  </div>
+
+                  <div className="mt-2.5 pt-2 border-top border-secondary-subtle small text-muted d-flex align-items-center justify-content-between">
+                    <span className="text-xxs fw-semibold text-dark">
+                      Sisa Kas Kemarin: {formatRupiah(saldoAwalBulanKemarin)}
+                    </span>
+                    <span className="badge bg-white text-secondary border rounded-pill px-2 py-0.5 text-xxs">
+                      Saldo Kas Riil
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Kolom 2: Total Pemasukan Bulan Ini */}
+              <div className="col-12 col-sm-6 col-md-3 col-xl-2.5">
+                <div className="p-3 rounded-3 h-100 border bg-light bg-opacity-50 d-flex flex-column justify-content-between">
+                  <div>
+                    <div className="d-flex align-items-center justify-content-between mb-1.5">
+                      <span className="text-muted fw-semibold text-xxs text-uppercase">Pemasukan Bulan Ini</span>
+                      <i className="bi bi-arrow-down-left-circle-fill text-success fs-5" />
+                    </div>
+                    <div className="h4 fw-bold text-success mb-0">
+                      + {formatRupiah(totalPemasukanBulanIni)}
+                    </div>
+                  </div>
+                  <div className="mt-2 pt-2 border-top small text-muted text-xxs d-flex justify-content-between align-items-center">
+                    <span>Donasi Masuk</span>
+                    <span className="badge bg-success-subtle text-success border border-success-subtle rounded-pill">
+                      {countPemasukan} Transaksi
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Kolom 3: Total Pengeluaran Bulan Ini */}
+              <div className="col-12 col-sm-6 col-md-3 col-xl-2.5">
+                <div className="p-3 rounded-3 h-100 border bg-light bg-opacity-50 d-flex flex-column justify-content-between">
+                  <div>
+                    <div className="d-flex align-items-center justify-content-between mb-1.5">
+                      <span className="text-muted fw-semibold text-xxs text-uppercase">Pengeluaran Tercatat</span>
+                      <i className="bi bi-arrow-up-right-circle-fill text-danger fs-5" />
+                    </div>
+                    <div className="h4 fw-bold text-danger mb-0">
+                      - {formatRupiah(totalPengeluaranBulanIni)}
+                    </div>
+                  </div>
+                  <div className="mt-2 pt-2 border-top small text-muted text-xxs d-flex justify-content-between align-items-center">
+                    <span>Biaya / Server</span>
+                    <span className="badge bg-danger-subtle text-danger border border-danger-subtle rounded-pill">
+                      {countPengeluaran} Transaksi
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* Kolom 4: Arus Kas Bersih Bulan Ini (Mutasi Pemasukan - Pengeluaran) */}
+              <div className="col-12 col-xl-3">
+                <div className={`p-3 rounded-3 h-100 border d-flex flex-column justify-content-between ${
+                  totalSaldoBersihBulanIni >= 0
+                    ? "bg-light bg-opacity-50"
+                    : "bg-warning-subtle bg-opacity-25 border-warning-subtle"
+                }`}>
+                  <div>
+                    <div className="d-flex align-items-center justify-content-between mb-1.5">
+                      <span className="text-muted fw-semibold text-xxs text-uppercase">Mutasi Bulan Ini</span>
+                      <span
+                        className={`badge rounded-pill px-2 py-0.5 text-xxs fw-bold ${
+                          totalSaldoBersihBulanIni >= 0
+                            ? "bg-success text-white"
+                            : "bg-warning-subtle text-dark border border-warning-subtle"
+                        }`}
+                      >
+                        {totalSaldoBersihBulanIni >= 0 ? "SURPLUS" : "TERTUTUP SISA LALU"}
+                      </span>
+                    </div>
+                    <div className={`h4 fw-bold mb-0 ${totalSaldoBersihBulanIni >= 0 ? "text-success" : "text-dark"}`}>
+                      {totalSaldoBersihBulanIni >= 0 ? `+${formatRupiah(totalSaldoBersihBulanIni)}` : formatRupiah(totalSaldoBersihBulanIni)}
+                    </div>
+                  </div>
+                  <div className="mt-2 pt-2 border-top text-xxs text-muted d-flex justify-content-between align-items-center">
+                    <span>Donasi Baru − Tagihan:</span>
+                    <span className="fw-semibold text-secondary">
+                      {totalSaldoBersihBulanIni < 0 ? "Ditutup kas kemarin" : "Arus positif"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Catatan Transparansi Rumus & Saldo */}
+            <div className="mt-3 pt-2.5 border-top d-flex flex-wrap align-items-center justify-content-between gap-2 text-xxs text-muted">
+              <div className="d-flex align-items-center gap-1.5">
+                <i className="bi bi-info-circle-fill text-primary" />
+                <span>
+                  <strong>Perhitungan Kas Riil:</strong> Sisa Bulan Kemarin ({formatRupiah(saldoAwalBulanKemarin)}) + Donasi Masuk ({formatRupiah(totalPemasukanBulanIni)}) − Tagihan Server ({formatRupiah(totalPengeluaranBulanIni)}) = <strong className="text-success">{formatRupiah(totalKasTersediaSaatIni)}</strong>.
+                </span>
+              </div>
+              <div className="text-secondary">
+                Mutasi Murni Bulan Ini = Pemasukan − Pengeluaran = <strong className={totalSaldoBersihBulanIni >= 0 ? "text-success" : "text-danger"}>{formatRupiah(totalSaldoBersihBulanIni)}</strong> (terbayar lunas menggunakan sisa kas lalu)
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 3. KPI Stat Cards */}
+      <div className="row g-3 mb-3">
+        {/* KPI 1 */}
+        <div className="col-12 col-sm-6 col-xl-3">
+          <div className="card shadow-sm border rounded-3 p-3 bg-white h-100">
+            <div className="d-flex justify-content-between align-items-center mb-2">
+              <span className="text-muted fw-semibold small text-uppercase">Sesi KBM Terjadwal</span>
+              <div
+                className="d-flex align-items-center justify-content-center rounded-3 bg-primary-subtle text-primary"
+                style={{ width: 38, height: 38 }}
+              >
+                <i className="bi bi-calendar-event fs-5" />
+              </div>
+            </div>
+            <div className="d-flex align-items-baseline gap-2">
+              <h2 className="fw-bold text-dark mb-0">{dateSchedules.length}</h2>
+              <span className="text-muted small">Sesi Kelas</span>
+            </div>
+            <div className="mt-2 pt-2 border-top d-flex justify-content-between align-items-center small text-muted">
+              <span>{scheduleLabel}</span>
+              <span className="badge bg-primary-subtle text-primary border border-primary-subtle">
+                Aktif
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* KPI 2 */}
+        <div className="col-12 col-sm-6 col-xl-3">
+          <div className="card shadow-sm border rounded-3 p-3 bg-white h-100">
+            <div className="d-flex justify-content-between align-items-center mb-2">
+              <span className="text-muted fw-semibold small text-uppercase">Pengajar Bertugas</span>
+              <div
+                className="d-flex align-items-center justify-content-center rounded-3 bg-success-subtle text-success"
+                style={{ width: 38, height: 38 }}
+              >
+                <i className="bi bi-person-check fs-5" />
+              </div>
+            </div>
+            <div className="d-flex align-items-baseline gap-2">
+              <h2 className="fw-bold text-dark mb-0">{uniqueTeachersCount}</h2>
+              <span className="text-muted small">Pengajar</span>
+            </div>
+            <div className="mt-2 pt-2 border-top d-flex justify-content-between align-items-center small text-muted">
+              <span>{userCabang ? `Cabang ${userCabang}` : "Semua Cabang"}</span>
+              <span className="badge bg-success-subtle text-success border border-success-subtle">
+                Siap Mengajar
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* KPI 3 */}
+        <div className="col-12 col-sm-6 col-xl-3">
+          <div className="card shadow-sm border rounded-3 p-3 bg-white h-100">
+            <div className="d-flex justify-content-between align-items-center mb-2">
+              <span className="text-muted fw-semibold small text-uppercase">Permintaan Antar Cabang</span>
+              <div
+                className="d-flex align-items-center justify-content-center rounded-3 bg-warning-subtle text-warning"
+                style={{ width: 38, height: 38 }}
+              >
+                <i className="bi bi-arrow-left-right fs-5" />
+              </div>
+            </div>
+            <div className="d-flex align-items-baseline gap-2">
+              <h2 className="fw-bold text-dark mb-0">{pendingRequests.length}</h2>
+              <span className="text-muted small">Permintaan</span>
+            </div>
+            <div className="mt-2 pt-2 border-top d-flex justify-content-between align-items-center small">
+              {pendingRequests.length > 0 ? (
+                <>
+                  <span className="text-warning fw-semibold">Menunggu Respon</span>
+                  <span className="badge bg-warning text-dark">Perlu Aksi</span>
+                </>
+              ) : (
+                <>
+                  <span className="text-muted">Tidak ada pending</span>
+                  <span className="badge bg-light text-muted border">Clear</span>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* KPI 4 */}
+        <div className="col-12 col-sm-6 col-xl-3">
+          <div className="card shadow-sm border rounded-3 p-3 bg-white h-100">
+            <div className="d-flex justify-content-between align-items-center mb-2">
+              <span className="text-muted fw-semibold small text-uppercase">Izin Pengajar</span>
+              <div
+                className="d-flex align-items-center justify-content-center rounded-3 bg-danger-subtle text-danger"
+                style={{ width: 38, height: 38 }}
+              >
+                <i className="bi bi-calendar-x fs-5" />
+              </div>
+            </div>
+            <div className="d-flex align-items-baseline gap-2">
+              <h2 className="fw-bold text-dark mb-0">{waitingIzinRequests.length}</h2>
+              <span className="text-muted small">Pengajuan</span>
+            </div>
+            <div className="mt-2 pt-2 border-top d-flex justify-content-between align-items-center small">
+              {waitingIzinRequests.length > 0 ? (
+                <>
+                  <span className="text-danger fw-semibold">{waitingIzinRequests.length} Izin Menunggu</span>
+                  <span className="badge bg-danger text-white">Verifikasi</span>
+                </>
+              ) : (
+                <>
+                  <span className="text-muted">Semua pengajar aktif</span>
+                  <span className="badge bg-success-subtle text-success border border-success-subtle">Nihil</span>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 4. Action Center Section (Jika ada persetujuan yang menunggu) */}
+      {hasPendingApprovals && (
+        <div id="approval-section" className="card shadow-sm border rounded-3 mb-3 bg-white overflow-hidden">
+          <div className="card-header bg-warning-subtle py-2.5 px-3 border-bottom d-flex flex-wrap justify-content-between align-items-center gap-2">
+            <div className="d-flex align-items-center gap-2">
+              <i className="bi bi-exclamation-octagon text-warning fs-5" />
+              <strong className="text-dark">Pusat Persetujuan & Verifikasi</strong>
+            </div>
+            <div className="d-flex gap-2">
+              {showPermintaanSection && (
+                <button
+                  type="button"
+                  className={`btn btn-sm ${effectiveApprovalTab === "permintaan" ? "btn-warning text-dark fw-bold" : "btn-outline-secondary bg-white"}`}
+                  onClick={() => setActiveApprovalTab("permintaan")}
+                >
+                  <i className="bi bi-arrow-left-right me-1" />
+                  Antar Cabang ({pendingRequests.length})
+                </button>
+              )}
+              {showIzinSection && (
+                <button
+                  type="button"
+                  className={`btn btn-sm ${effectiveApprovalTab === "izin" ? "btn-primary fw-bold" : "btn-outline-secondary bg-white"}`}
+                  onClick={() => setActiveApprovalTab("izin")}
+                >
+                  <i className="bi bi-file-earmark-medical me-1" />
+                  Izin Pengajar ({waitingIzinRequests.length})
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="table-responsive">
+            {effectiveApprovalTab === "permintaan" && showPermintaanSection && (
+              <table className="table table-hover align-middle mb-0 small">
+                <thead className="table-light">
+                  <tr>
+                    <th className="ps-3">Pengajar</th>
+                    <th>Cabang Peminta</th>
+                    <th>Cabang Domisili</th>
+                    <th>Status</th>
+                    <th className="text-end pe-3" style={{ width: 170 }}>Aksi Keputusan</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pendingRequests.map((item) => {
+                    const statusKey = normalizeText(item.status || "Menunggu");
+                    const isFromDariCabang = isAdmin || normalizeText(userCabang) === normalizeText(item.cabangDomisili || "");
+                    const canShowAction = canManagePermintaan && statusKey === "menunggu" && isFromDariCabang;
+
+                    return (
+                      <tr key={item.id}>
+                        <td className="ps-3">
+                          <div className="d-flex align-items-center gap-2">
+                            <div
+                              className="text-white fw-bold d-flex align-items-center justify-content-center rounded-circle flex-shrink-0"
+                              style={{ width: 32, height: 32, backgroundColor: getAvatarBg(item.namaPengajar), fontSize: "11px" }}
+                            >
+                              {getInitials(item.namaPengajar)}
+                            </div>
+                            <div>
+                              <div className="fw-semibold text-dark">{item.namaPengajar || "-"}</div>
+                              <div className="text-muted text-xxs">Kode: {item.kodePengajar || "-"}</div>
+                            </div>
+                          </div>
+                        </td>
+                        <td>
+                          <span className="badge bg-primary-subtle text-primary border border-primary-subtle">
+                            {item.cabangPeminta || "-"}
+                          </span>
+                        </td>
+                        <td>
+                          <span className="badge bg-light text-dark border">
+                            {item.cabangDomisili || "-"}
+                          </span>
+                        </td>
+                        <td>
+                          <span className="badge bg-warning text-dark">
+                            {item.status || "Menunggu"}
+                          </span>
+                        </td>
+                        <td className="text-end pe-3">
+                          {canShowAction ? (
+                            <div className="d-flex justify-content-end gap-1">
+                              <button
+                                type="button"
+                                className="btn btn-sm btn-success px-2 py-1"
+                                onClick={() => onApprovePermintaan(item)}
+                              >
+                                <i className="bi bi-check-lg me-1" />
+                                Setujui
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-sm btn-outline-danger px-2 py-1"
+                                onClick={() => onRejectPermintaan(item)}
+                              >
+                                <i className="bi bi-x-lg me-1" />
+                                Tolak
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="text-muted fst-italic small">Hanya cabang asal / Admin</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+
+            {effectiveApprovalTab === "izin" && showIzinSection && (
+              <table className="table table-hover align-middle mb-0 small">
+                <thead className="table-light">
+                  <tr>
+                    <th className="ps-3">Nama Pengajar</th>
+                    <th>Domisili (Asal)</th>
+                    <th>Cabang Target</th>
+                    <th>Periode Izin</th>
+                    <th>Keterangan</th>
+                    <th>Status</th>
+                    <th className="text-end pe-3" style={{ width: 170 }}>Aksi Keputusan</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {waitingIzinRequests.map((item) => {
+                    const normalizedStatus = normalizeText(item.status || "Menunggu");
+                    
+                    // Verifikasi diperbolehkan untuk: Admin, Cabang Asal (Domisili), dan Cabang Target
+                    const isAllowedToVerify = (() => {
+                      if (isAdmin || !userCabang) return true;
+                      const currentCabang = normalizeText(userCabang);
+                      const domisili = normalizeText(item.domisili || "");
+                      if (domisili && domisili === currentCabang) return true;
+
+                      const targetList = (item.cabangTarget || "")
+                        .split(",")
+                        .map((c) => normalizeText(c))
+                        .filter(Boolean);
+
+                      if (targetList.length === 0 || targetList.includes("semua cabang") || targetList.includes("semua")) {
+                        return true;
+                      }
+
+                      return targetList.includes(currentCabang);
+                    })();
+
+                    const canShowAction = canManageIzin && normalizedStatus === "menunggu" && isAllowedToVerify;
+
+                    const targetList = (item.cabangTarget || "")
+                      .split(",")
+                      .map((c) => c.trim())
+                      .filter(Boolean);
+
+                    return (
+                      <tr key={item.id}>
+                        <td className="ps-3">
+                          <div className="d-flex align-items-center gap-2">
+                            <div
+                              className="text-white fw-bold d-flex align-items-center justify-content-center rounded-circle flex-shrink-0"
+                              style={{ width: 32, height: 32, backgroundColor: getAvatarBg(item.namaPengajar), fontSize: "11px" }}
+                            >
+                              {getInitials(item.namaPengajar)}
+                            </div>
+                            <span className="fw-semibold text-dark">{item.namaPengajar || "-"}</span>
+                          </div>
+                        </td>
+                        <td>
+                          <span className="badge bg-light text-dark border">
+                            {item.domisili || "-"}
+                          </span>
+                        </td>
+                        <td>
+                          <div className="d-flex flex-wrap gap-1" style={{ maxWidth: 180 }}>
+                            {targetList.length === 0 ? (
+                              <span className="badge bg-secondary-subtle text-secondary border border-secondary-subtle">
+                                Semua Cabang
+                              </span>
+                            ) : (
+                              targetList.map((cab, cIdx) => (
+                                <span key={cIdx} className="badge bg-primary-subtle text-primary border border-primary-subtle">
+                                  {cab}
+                                </span>
+                              ))
+                            )}
+                          </div>
+                        </td>
+                        <td>
+                          {item.tanggalMulai} s.d. {item.tanggalSelesai}
+                        </td>
+                        <td className="text-truncate" style={{ maxWidth: 200 }} title={item.keterangan}>
+                          {item.keterangan || "-"}
+                        </td>
+                        <td>
+                          <span className="badge bg-warning text-dark">
+                            {item.status || "Menunggu"}
+                          </span>
+                        </td>
+                        <td className="text-end pe-3">
+                          {canShowAction ? (
+                            <div className="d-flex justify-content-end gap-1">
+                              <button
+                                type="button"
+                                className="btn btn-sm btn-success px-2 py-1"
+                                onClick={() => onApproveIzin(item)}
+                              >
+                                <i className="bi bi-check-lg me-1" />
+                                Setujui
+                              </button>
+                              <button
+                                type="button"
+                                className="btn btn-sm btn-outline-danger px-2 py-1"
+                                onClick={() => onRejectIzin(item)}
+                              >
+                                <i className="bi bi-x-lg me-1" />
+                                Tolak
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="text-muted fst-italic small">
+                              {!isAllowedToVerify ? "Hanya cabang target / asal / Admin" : "Tidak diizinkan"}
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 4. Main Schedules Explorer */}
+      <div className="card shadow-sm border rounded-3 bg-white mb-4">
+        {/* Header Toolbar */}
+        <div className="card-header bg-white py-3 px-3 px-md-4 border-bottom">
+          <div className="d-flex flex-column flex-lg-row justify-content-between align-items-stretch align-items-lg-center gap-3">
+            <div>
+              <div className="d-flex align-items-center gap-2">
+                <i className="bi bi-calendar2-week text-primary fs-5" />
+                <h6 className="fw-bold mb-0 text-dark">
+                  Jadwal KBM: {scheduleLabel}
+                </h6>
+              </div>
+              <div className="text-muted small mt-0.5">
+                Menampilkan <strong>{filteredSchedules.length}</strong> sesi dari <strong>{scheduleGroups.size}</strong> pengajar
+              </div>
+            </div>
+
+            {/* Filter & Controls */}
+            <div className="d-flex flex-wrap align-items-center gap-2">
+              {/* Search */}
+              <div className="input-group input-group-sm" style={{ width: 220 }}>
+                <span className="input-group-text bg-light">
+                  <i className="bi bi-search text-muted" />
+                </span>
+                <input
+                  type="text"
+                  className="form-control"
+                  placeholder="Cari pengajar, mapel..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    className="btn btn-outline-secondary bg-white"
+                    onClick={() => setSearchQuery("")}
+                  >
+                    <i className="bi bi-x" />
+                  </button>
+                )}
+              </div>
+
+              {/* Filter Type */}
+              <div className="btn-group btn-group-sm" role="group">
+                <button
+                  type="button"
+                  className={`btn ${filterType === "all" ? "btn-secondary fw-bold" : "btn-outline-secondary bg-white"}`}
+                  onClick={() => setFilterType("all")}
+                >
+                  Semua
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${filterType === "reguler" ? "btn-secondary fw-bold" : "btn-outline-secondary bg-white"}`}
+                  onClick={() => setFilterType("reguler")}
+                >
+                  Reguler
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${filterType === "khusus" ? "btn-secondary fw-bold" : "btn-outline-secondary bg-white"}`}
+                  onClick={() => setFilterType("khusus")}
+                >
+                  Khusus
+                </button>
+              </div>
+
+              {/* View Toggle */}
+              <div className="btn-group btn-group-sm" role="group">
+                <button
+                  type="button"
+                  className={`btn ${viewMode === "cards" ? "btn-primary fw-bold" : "btn-outline-secondary bg-white"}`}
+                  onClick={() => setViewMode("cards")}
+                >
+                  <i className="bi bi-grid-fill me-1" />
+                  Kartu
+                </button>
+                <button
+                  type="button"
+                  className={`btn ${viewMode === "table" ? "btn-primary fw-bold" : "btn-outline-secondary bg-white"}`}
+                  onClick={() => setViewMode("table")}
+                >
+                  <i className="bi bi-list-ul me-1" />
+                  Daftar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Content Body */}
+        <div className="card-body p-3 p-md-4 bg-light">
+          {loading ? (
+            <div className="py-5 text-center text-muted">
+              <div className="spinner-border text-primary spinner-border-sm me-2" role="status" />
+              <span>Memuat data jadwal dashboard...</span>
+            </div>
+          ) : filteredSchedules.length === 0 ? (
+            <div className="py-5 text-center bg-white rounded-3 border p-4">
+              <div
+                className="d-inline-flex align-items-center justify-content-center rounded-circle bg-light text-muted mb-2"
+                style={{ width: 52, height: 52 }}
+              >
+                <i className="bi bi-calendar2-x fs-3" />
+              </div>
+              <h6 className="fw-bold text-dark mb-1">Tidak Ada Jadwal KBM</h6>
+              <p className="text-muted small mb-3">
+                {searchQuery
+                  ? `Tidak ada jadwal yang cocok dengan kata kunci "${searchQuery}".`
+                  : `Tidak ada sesi KBM yang dijadwalkan untuk ${scheduleLabel}.`}
+              </p>
+              {scheduleMode !== "today" && (
+                <button
+                  type="button"
+                  className="btn btn-sm btn-outline-primary px-3"
+                  onClick={() => setScheduleMode("today")}
+                >
+                  <i className="bi bi-arrow-return-left me-1" />
+                  Kembali ke Hari Ini
+                </button>
+              )}
+            </div>
+          ) : viewMode === "cards" ? (
+            /* Cards View with incremental loading to prevent RAM spikes */
+            (() => {
+              const scheduleGroupEntries = Array.from(scheduleGroups.entries());
+              const visibleEntries = scheduleGroupEntries.slice(0, cardsLimit);
+              const remainingCount = scheduleGroupEntries.length - visibleEntries.length;
+
+              return (
+                <>
+                  <div className="row row-cols-1 row-cols-md-2 row-cols-xl-3 g-3">
+                    {visibleEntries.map(([pengajar, items]) => {
+                      const avatarColor = getAvatarBg(pengajar);
+                      const initials = getInitials(pengajar);
+
+                      return (
+                        <div key={pengajar} className="col">
+                          <div className="card h-100 border shadow-sm rounded-3 bg-white">
+                            {/* Teacher Header */}
+                            <div className="card-header bg-white py-2.5 px-3 border-bottom d-flex align-items-center justify-content-between">
+                              <div className="d-flex align-items-center gap-2 text-truncate">
+                                <div
+                                  className="text-white fw-bold d-flex align-items-center justify-content-center rounded-circle flex-shrink-0"
+                                  style={{
+                                    width: 36,
+                                    height: 36,
+                                    minWidth: 36,
+                                    minHeight: 36,
+                                    backgroundColor: avatarColor,
+                                    fontSize: "12px",
+                                  }}
+                                >
+                                  {initials}
+                                </div>
+                                <div className="text-truncate">
+                                  <div className="fw-bold text-dark text-truncate" title={pengajar}>
+                                    {pengajar}
+                                  </div>
+                                  <div className="text-muted text-xxs d-flex align-items-center gap-1">
+                                    <span><i className="bi bi-clock me-0.5" />{items.length} Sesi</span>
+                                    {items[0]?.cabang && (
+                                      <span>• <i className="bi bi-geo-alt me-0.5" />{items[0].cabang}</span>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+
+                              <span className="badge bg-primary-subtle text-primary border border-primary-subtle rounded-pill px-2 py-1">
+                                {items.length} Sesi
+                              </span>
+                            </div>
+
+                            {/* Sessions List */}
+                            <div className="card-body p-2.5">
+                              <div className="d-flex flex-column gap-2">
+                                {items.map((item) => {
+                                  const tagStyle = getTagStyle(item.mapel || "default", "mapel");
+                                  const isReguler = (item.sourceLabel || "").toLowerCase().includes("reguler");
+
+                                  return (
+                                    <div
+                                      key={item.id}
+                                      className="p-2 rounded-2 border bg-light d-flex align-items-start justify-content-between gap-2"
+                                    >
+                                      <div className="d-flex align-items-start gap-2 flex-grow-1">
+                                        {/* Jam Sesi */}
+                                        <div
+                                          className="px-2 py-1 bg-white border rounded text-dark font-monospace fw-semibold text-center flex-shrink-0 mt-1"
+                                          style={{ fontSize: "11px", minWidth: 80 }}
+                                        >
+                                          <i className="bi bi-clock me-1 text-primary" />
+                                          {item.waktu || "-"}
+                                        </div>
+
+                                        {/* Mapel & Kelas */}
+                                        <div className="d-flex flex-wrap gap-1.5 flex-grow-1">
+                                          <span
+                                            className="badge px-2 py-1 rounded border fw-semibold text-wrap text-start"
+                                            style={{
+                                              backgroundColor: tagStyle.backgroundColor || "#e2e8f0",
+                                              borderColor: tagStyle.borderColor || "#cbd5e1",
+                                              color: tagStyle.color || "#1e293b",
+                                              lineHeight: "1.3",
+                                            }}
+                                            title={item.mapel}
+                                          >
+                                            {item.mapel || "-"}
+                                          </span>
+                                          <span 
+                                            className="badge bg-white text-dark border px-2 py-1 rounded text-wrap text-start"
+                                            style={{ lineHeight: "1.3" }}
+                                          >
+                                            {item.kelas || "-"}
+                                          </span>
+                                        </div>
+                                      </div>
+
+                                      {/* Jenis KBM */}
+                                      <span
+                                        className={`badge px-2 py-1 rounded-pill flex-shrink-0 mt-1 ${
+                                          isReguler
+                                            ? "bg-secondary-subtle text-secondary border border-secondary-subtle"
+                                            : "bg-info-subtle text-info border border-info-subtle"
+                                        }`}
+                                      >
+                                        {item.sourceLabel}
+                                      </span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {remainingCount > 0 && (
+                    <div ref={loadMoreRef} className="mt-4 py-4 text-center text-muted border-top border-dashed">
+                      <div className="spinner-border spinner-border-sm me-2" role="status" />
+                      <span>Memuat {remainingCount} pengajar lainnya...</span>
+                    </div>
+                  )}
+                </>
+              );
+            })()
+          ) : (
+            /* Table View with pagination */
+            (() => {
+              const totalTablePages = Math.ceil(chronologicalSchedules.length / TABLE_PAGE_SIZE) || 1;
+              const safeTablePage = Math.min(tablePage, totalTablePages);
+              const startIndex = (safeTablePage - 1) * TABLE_PAGE_SIZE;
+              const pageSchedules = chronologicalSchedules.slice(startIndex, startIndex + TABLE_PAGE_SIZE);
+
+              return (
+                <div className="bg-white rounded-3 border overflow-hidden shadow-xs">
+                  <div className="table-responsive">
+                    <table className="table table-hover align-middle mb-0 small">
+                      <thead className="table-light">
+                        <tr>
+                          <th className="ps-3" style={{ width: 120 }}>Waktu</th>
+                          <th>Mata Pelajaran</th>
+                          <th>Kelas</th>
+                          <th>Pengajar</th>
+                          <th>Cabang</th>
+                          <th className="pe-3" style={{ width: 110 }}>Jenis KBM</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pageSchedules.map((item) => {
+                          const tagStyle = getTagStyle(item.mapel || "default", "mapel");
+                          const isReguler = (item.sourceLabel || "").toLowerCase().includes("reguler");
+
+                          return (
+                            <tr key={item.id}>
+                              <td className="ps-3 font-monospace fw-semibold text-primary">
+                                <i className="bi bi-clock me-1 text-muted" />
+                                {item.waktu || "-"}
+                              </td>
+                              <td>
+                                <span
+                                  className="badge px-2 py-1 rounded-pill border fw-semibold"
+                                  style={{
+                                    backgroundColor: tagStyle.backgroundColor || "#e2e8f0",
+                                    borderColor: tagStyle.borderColor || "#cbd5e1",
+                                    color: tagStyle.color || "#1e293b",
+                                  }}
+                                >
+                                  {item.mapel || "-"}
+                                </span>
+                              </td>
+                              <td>
+                                <strong className="text-dark">{item.kelas || "-"}</strong>
+                              </td>
+                              <td>
+                                <div className="d-flex align-items-center gap-2">
+                                  <div
+                                    className="text-white fw-bold d-flex align-items-center justify-content-center rounded-circle flex-shrink-0"
+                                    style={{
+                                      width: 26,
+                                      height: 26,
+                                      backgroundColor: getAvatarBg(item.pengajar),
+                                      fontSize: "10px",
+                                    }}
+                                  >
+                                    {getInitials(item.pengajar)}
+                                  </div>
+                                  <span className="fw-semibold text-dark">{item.pengajar || "-"}</span>
+                                </div>
+                              </td>
+                              <td>
+                                <span className="text-muted">{item.cabang || "-"}</span>
+                              </td>
+                              <td className="pe-3">
+                                <span
+                                  className={`badge px-2 py-1 rounded-pill ${
+                                    isReguler
+                                      ? "bg-secondary-subtle text-secondary border border-secondary-subtle"
+                                      : "bg-info-subtle text-info border border-info-subtle"
+                                  }`}
+                                >
+                                  {item.sourceLabel}
+                                </span>
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {totalTablePages > 1 && (
+                    <div className="p-2.5 border-top d-flex flex-wrap align-items-center justify-content-between gap-2 bg-light">
+                      <span className="text-muted text-xxs ps-2">
+                        Menampilkan {startIndex + 1} - {Math.min(startIndex + TABLE_PAGE_SIZE, chronologicalSchedules.length)} dari {chronologicalSchedules.length} sesi
+                      </span>
+                      <div className="btn-group btn-group-sm">
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary btn-sm py-0.5 px-2.5 bg-white"
+                          disabled={safeTablePage <= 1}
+                          onClick={() => setTablePage((p) => Math.max(1, p - 1))}
+                        >
+                          <i className="bi bi-chevron-left" />
+                        </button>
+                        <span className="btn btn-light btn-sm py-0.5 px-3 border text-xxs fw-semibold disabled">
+                          Halaman {safeTablePage} / {totalTablePages}
+                        </span>
+                        <button
+                          type="button"
+                          className="btn btn-outline-secondary btn-sm py-0.5 px-2.5 bg-white"
+                          disabled={safeTablePage >= totalTablePages}
+                          onClick={() => setTablePage((p) => Math.min(totalTablePages, p + 1))}
+                        >
+                          <i className="bi bi-chevron-right" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()
+          )}
+        </div>
+      </div>
+    </div>
+  );
+});

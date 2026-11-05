@@ -1,0 +1,783 @@
+import { apiFetch } from "./api";
+import { formatLocalDate, parseFlexibleDate } from "../utils/schedule";
+
+const normalizeValueKey = (val: string) => String(val || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
+
+export type DbRow = {
+  id: string;
+  data: Record<string, string>;
+  createdAt?: string;
+  updatedAt?: string;
+};
+
+const bucketTableMap = {
+  jadwal_reguler: "jadwal_kbm",
+  jadwal_khusus: "jadwal_kbm",
+  jadwal_kbm: "jadwal_kbm",
+  mata_pelajaran: "mata_pelajaran",
+  pengajar: "pengajar",
+  accounts_cabang: "accounts_cabang",
+  surat_tugas: "surat_tugas_pengajar",
+  penempatan_pengajar_dicabang: "penempatan_pengajar_dicabang",
+  izin_pengajar: "izin_pengajar",
+  permintaan_pengajar: "permintaan_pengajar_antar_cabang",
+  libur_nasional: "libur_nasional",
+  riwayat_notifikasi_pengajar: "riwayat_notifikasi_pengajar",
+  donasi: "donasi",
+  donasi_transaksi: "donasi_transaksi",
+  donasi_transaksi_tagihan: "donasi_transaksi_tagihan",
+} as const;
+
+type BucketName = keyof typeof bucketTableMap;
+
+type BucketSchema = {
+  table: string;
+  fromDb: (row: Record<string, unknown>) => Record<string, string>;
+  toDb: (data: Record<string, string>) => Record<string, string | number | boolean | null>;
+};
+
+const encodeId = (bucket: string, id: string) => `${bucket}:${id}`;
+
+export const decodeId = (encoded: string, fallbackBucket: string = "jadwal_kbm") => {
+  const str = String(encoded || "");
+  if (!str.includes(":")) {
+    const bucket = fallbackBucket in bucketTableMap ? fallbackBucket : "jadwal_kbm";
+    return { bucket: bucket as BucketName, id: str };
+  }
+  const [bucket, ...rest] = str.split(":");
+  const id = rest.join(":");
+  if (!bucket || !id || !(bucket in bucketTableMap)) {
+    return { bucket: (fallbackBucket in bucketTableMap ? fallbackBucket : "jadwal_kbm") as BucketName, id: id || str };
+  }
+  return { bucket: bucket as BucketName, id };
+};
+
+const asString = (value: unknown) =>
+  value === undefined || value === null ? "" : String(value);
+
+const asNumberOrNull = (value: unknown) => {
+  const parsed = Number(String(value ?? "").trim());
+  return Number.isFinite(parsed) ? parsed : null;
+};
+
+const asBoolean = (value: unknown) => {
+  if (value === undefined || value === null) return false;
+  const raw = String(value).trim().toLowerCase();
+  return raw === "1" || raw === "true" || raw === "t" || raw === "yes" || raw === "y";
+};
+
+const asBooleanInt = (value: unknown) => (asBoolean(value) ? 1 : 0);
+
+const asTimestampOrNull = (value: unknown) => {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const raw = String(value).trim();
+  if (!raw) {
+    return null;
+  }
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) {
+    return null;
+  }
+  return parsed.toISOString();
+};
+
+const normalizeAvailabilityEntries = (value: unknown) => {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (!item || typeof item !== "object") {
+          return null;
+        }
+        const entry = item as Record<string, unknown>;
+        const hari = String(entry.hari ?? entry.Hari ?? "").trim();
+        if (!hari) {
+          return null;
+        }
+        const jamMulai = String(entry.jamMulai ?? entry.jam_mulai ?? "").trim();
+        const jamSelesai = String(entry.jamSelesai ?? entry.jam_selesai ?? "").trim();
+        const cabangList = Array.isArray(entry.cabangList)
+          ? entry.cabangList.map((cabang) => String(cabang ?? "").trim()).filter(Boolean)
+          : String(entry.cabangList ?? entry.cabang_penempatan ?? "")
+              .split(",")
+              .map((item) => item.trim())
+              .filter(Boolean);
+        return {
+          hari,
+          jamMulai,
+          jamSelesai,
+          cabangList,
+        };
+      })
+      .filter((item): item is { hari: string; jamMulai: string; jamSelesai: string; cabangList: string[] } => Boolean(item));
+  }
+
+  if (typeof value === "string") {
+    try {
+      return normalizeAvailabilityEntries(JSON.parse(value));
+    } catch (_error) {
+      return [];
+    }
+  }
+
+  return [];
+};
+
+const normalizeDbDate = (value: unknown) => {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return "";
+  }
+  const parsed = parseFlexibleDate(raw);
+  return parsed ? formatLocalDate(parsed) : raw;
+};
+
+const extractMonthValue = (value: unknown) => {
+  const raw = String(value ?? "").trim();
+  if (!raw) {
+    return "";
+  }
+  const parsed = parseFlexibleDate(raw);
+  if (parsed) {
+    return `${parsed.getFullYear().toString().padStart(4, "0")}-${(parsed.getMonth() + 1)
+      .toString()
+      .padStart(2, "0")}`;
+  }
+  return raw.slice(0, 7);
+};
+
+const jadwalKbmSchema: BucketSchema = {
+  table: bucketTableMap.jadwal_kbm,
+  fromDb: (row) => {
+    const jamMulai = asString((row as any).jam_mulai_kbm || (row as any).jam_mulai || "");
+    const jamSelesai = asString((row as any).jam_selesai_kbm || (row as any).jam_selesai || "");
+    const waktu = asString((row as any).waktu || (jamMulai && jamSelesai ? `${jamMulai} - ${jamSelesai}` : jamMulai || jamSelesai));
+    const cabang = asString((row as any).cabang || (row as any).cabang_kbm || (row as any).nama_cabang || (row as any)["Nama Cabang"] || "");
+    const sekolah = asString((row as any).sekolah || (row as any).asal_sekolah || "");
+    const mapel = asString((row as any).mata_pelajaran || (row as any).mapel || "");
+    const kodePengajar = asString((row as any).kode_pengajar || "");
+    const namaPengajar = asString((row as any).nama_pengajar || "");
+    const rawTanggal = (row as any).tanggal_kbm ?? (row as any).tanggal ?? "";
+    const rawBulan = (row as any).bulan || rawTanggal;
+
+    return {
+      Cabang: cabang,
+      Kelas: asString((row as any).kelas),
+      Sekolah: sekolah,
+      "Jenjang Studi": asString((row as any).jenjang_studi || (row as any).jenjang || ""),
+      jenjang: asString((row as any).jenjang_studi || (row as any).jenjang || ""),
+      Tanggal: normalizeDbDate(rawTanggal),
+      Bulan: extractMonthValue(rawBulan),
+      bulan: extractMonthValue(rawBulan),
+      Mapel: mapel,
+      Pengajar: asString(kodePengajar || namaPengajar),
+      "Kode Pengajar": kodePengajar,
+      "Nama Pengajar": namaPengajar,
+      NIP: asString((row as any).nip || (row as any).NIP || ""),
+      nip: asString((row as any).nip || (row as any).NIP || ""),
+      Waktu: waktu,
+      "Urutan Kelas": asString((row as any).class_order),
+      Gabung: asString((row as any).gabung),
+      IsGabung: asString((row as any).is_gabung),
+      "Jenis KBM": asString((row as any).jenis_kbm || "Reguler"),
+      jenis_kbm: asString((row as any).jenis_kbm || "Reguler"),
+      CreatedAt: asString((row as any).created_at),
+      UpdatedAt: asString((row as any).updated_at),
+    };
+  },
+  toDb: (data) => {
+    const jamMulai = asString((data as any).jam_mulai_kbm || (data as any).jam_mulai || "");
+    const jamSelesai = asString((data as any).jam_selesai_kbm || (data as any).jam_selesai || "");
+    const rawTanggal = asString((data as any).tanggal_kbm || data.Tanggal || data.tanggal || "");
+    const cabang = asString(data.Cabang || (data as any).cabang || (data as any).nama_cabang || (data as any)["Nama Cabang"] || "");
+    const sekolah = asString(data.Sekolah || (data as any).asal_sekolah || "");
+    const mapel = asString(data.Mapel || (data as any).mata_pelajaran || (data as any).mapel || "");
+    const kodePengajar = asString((data as any)["Kode Pengajar"] || data.Pengajar || (data as any).kode_pengajar || "");
+    const namaPengajar = asString((data as any)["Nama Pengajar"] || (data as any).Nama || (data as any).nama_pengajar || "");
+
+    return {
+      cabang,
+      kelas: asString(data.Kelas),
+      sekolah,
+      jenjang_studi: asString((data as any)["Jenjang Studi"] || (data as any).jenjang || (data as any).jenjang_studi || ""),
+      tanggal: normalizeDbDate(rawTanggal),
+      tanggal_kbm: normalizeDbDate(rawTanggal),
+      bulan: extractMonthValue(data.Bulan || rawTanggal),
+      mata_pelajaran: mapel,
+      kode_pengajar: kodePengajar,
+      nama_pengajar: kodePengajar ? namaPengajar : "",
+      nip: asString((data as any).NIP || (data as any).nip || ""),
+      waktu: asString(data.Waktu || (jamMulai && jamSelesai ? `${jamMulai} - ${jamSelesai}` : jamMulai || jamSelesai)),
+      jam_mulai_kbm: jamMulai,
+      jam_selesai_kbm: jamSelesai,
+      class_order: asNumberOrNull(data["Urutan Kelas"]),
+      gabung: asString((data as any).Gabung || (data as any).gabung),
+      jenis_kbm: asString((data as any)["Jenis KBM"] || (data as any).jenis_kbm || "Reguler"),
+      is_gabung: asBooleanInt((data as any).IsGabung || (data as any).is_gabung || (data as any).isGabung),
+      created_at: asString((data as any).CreatedAt || new Date().toISOString()),
+      updated_at: new Date().toISOString(),
+    };
+  },
+};
+
+const schemas: Record<BucketName, BucketSchema> = {
+  jadwal_reguler: jadwalKbmSchema,
+  jadwal_khusus: jadwalKbmSchema,
+  jadwal_kbm: jadwalKbmSchema,
+  mata_pelajaran: {
+    table: bucketTableMap.mata_pelajaran,
+    fromDb: (row) => ({
+      Mapel: asString(row.mata_pelajaran),
+      Kode_Mapel: asString(row.kode_mata_pelajaran),
+      Kategori: asString(row.kategory || row.kategori || "UMUM"),
+    }),
+    toDb: (data) => ({
+      mata_pelajaran: asString(data.Mapel),
+      kode_mata_pelajaran: asString(data.Kode_Mapel),
+      kategory: asString(data.Kategori || data.kategori || data.Kategory || "UMUM"),
+    }),
+  },
+  pengajar: {
+    table: bucketTableMap.pengajar,
+    fromDb: (row) => ({
+      "Kode Pengajar": asString(row.kode_pengajar),
+      NIP: asString(row.nip || (row as any).NIP),
+      nip: asString(row.nip || (row as any).NIP),
+      Nama: asString(row.nama_pengajar || row.nama),
+      "Nama Pengajar": asString(row.nama_pengajar || row.nama),
+      "Bidang Studi": asString(row.bidang_studi_mata_pelajaran),
+      Email: asString(row.email),
+      "No.WhatsApp": asString(row.no_whatsapp),
+      Domisili: asString(row.domisili),
+      Username: asString(row.username),
+      Password: asString(row.password_hash),
+    }),
+    toDb: (data) => ({
+      kode_pengajar: asString(data["Kode Pengajar"]),
+      nip: asString(data.NIP || data.nip),
+      nama_pengajar: asString(data.Nama || data["Nama Pengajar"]),
+      bidang_studi_mata_pelajaran: asString(data["Bidang Studi"]),
+      email: asString(data.Email),
+      no_whatsapp: asString(data["No.WhatsApp"]),
+      domisili: asString(data.Domisili),
+      username: asString(data.Username),
+      password_hash: asString(data.Password),
+    }),
+  },
+  accounts_cabang: {
+    table: bucketTableMap.accounts_cabang,
+    fromDb: (row) => ({
+      Username: asString(row.username),
+      Password: asString(row.password),
+      Roll: asString(row.roll),
+      Cabang: asString(row.cabang),
+      "Created At": asString((row as any).created_at),
+      "Updated At": asString((row as any).updated_at),
+    }),
+    toDb: (data) => ({
+      username: asString(data.Username),
+      password: asString(data.Password),
+      roll: asString(data.Roll),
+      cabang: asString(data.Cabang),
+    }),
+  },
+  donasi: {
+    table: bucketTableMap.donasi,
+    fromDb: (row) => ({
+      ID: asString(row.id),
+      "Nama Pemilik": asString(row.nama_pemilik),
+      "Nama Bank": asString(row.nama_bank),
+      "Alamat Rekening": asString(row.alamat_rekening),
+      "Created At": asString((row as any).created_at),
+      "Updated At": asString((row as any).updated_at),
+    }),
+    toDb: (data) => ({
+      nama_pemilik: asString(data["Nama Pemilik"] || data.nama_pemilik),
+      nama_bank: asString(data["Nama Bank"] || data.nama_bank),
+      alamat_rekening: asString(data["Alamat Rekening"] || data.alamat_rekening),
+    }),
+  },
+  donasi_transaksi: {
+    table: bucketTableMap.donasi_transaksi,
+    fromDb: (row) => ({
+      ID: asString(row.id),
+      "Nama Pengirim": asString(row.nama_pengirim),
+      Tanggal: asString(row.tanggal),
+      "Jumlah Transaksi Masuk": String(row.jumlah_transaksi_masuk ?? 0),
+      "Jumlah Transaksi Keluar": String(row.jumlah_transaksi_keluar ?? 0),
+      Keterangan: asString(row.keterangan || "donasi masuk"),
+      "Hidden Nama Pengirim": String(row.hidden_nama_pengirim ?? 0),
+      "Jenis Transaksi": asString((row as any).jenis_transaksi || "Dana Masuk"),
+      "Created At": asString((row as any).created_at),
+      "Updated At": asString((row as any).updated_at),
+    }),
+    toDb: (data) => ({
+      nama_pengirim: asString(data["Nama Pengirim"] || data.nama_pengirim),
+      tanggal: asString(data.Tanggal || data.tanggal),
+      jumlah_transaksi_masuk: asNumberOrNull(data["Jumlah Transaksi Masuk"] ?? data.jumlah_transaksi_masuk) ?? 0,
+      jumlah_transaksi_keluar: asNumberOrNull(data["Jumlah Transaksi Keluar"] ?? data.jumlah_transaksi_keluar) ?? 0,
+      keterangan: asString(data.Keterangan || data.keterangan || "donasi masuk"),
+      hidden_nama_pengirim: Number(data["Hidden Nama Pengirim"] ?? data.hidden_nama_pengirim ?? 0) ? 1 : 0,
+      jenis_transaksi: asString(data["Jenis Transaksi"] || (data as any).jenis_transaksi || "Dana Masuk"),
+    }),
+  },
+  donasi_transaksi_tagihan: {
+    table: bucketTableMap.donasi_transaksi_tagihan,
+    fromDb: (row) => ({
+      ID: asString(row.id),
+      "Nama Pengirim": asString(row.nama_pengirim),
+      Tanggal: asString(row.tanggal),
+      "Jumlah Tagihan": String(row.jumlah_tagihan ?? 0),
+      Keterangan: asString(row.keterangan || "tagihan bulan ini"),
+      "Created At": asString((row as any).created_at),
+      "Updated At": asString((row as any).updated_at),
+      Status: asString((row as any).status || "Belum Dibayar"),
+      "Is Lunas": String((row as any).is_lunas ?? 0),
+      "Tanggal Bayar": asString((row as any).tanggal_bayar || ""),
+    }),
+    toDb: (data) => {
+      const res: Record<string, string | number | boolean | null> = {
+        nama_pengirim: asString(data["Nama Pengirim"] || data.nama_pengirim),
+        tanggal: asString(data.Tanggal || data.tanggal),
+        jumlah_tagihan: asNumberOrNull(data["Jumlah Tagihan"] ?? data.jumlah_tagihan) ?? 0,
+        keterangan: asString(data.Keterangan || data.keterangan || "tagihan bulan ini"),
+        status: asString(data.Status || data.status || "Belum Dibayar"),
+        is_lunas: Number(data["Is Lunas"] ?? data.is_lunas ?? 0) ? 1 : 0,
+        tanggal_bayar: asString(data["Tanggal Bayar"] ?? data.tanggal_bayar) || null,
+      };
+      const rawId = data.ID ?? data.id;
+      if (rawId !== undefined && rawId !== null && rawId !== "") {
+        res.id = !isNaN(Number(rawId)) ? Number(rawId) : String(rawId);
+      }
+      return res;
+    },
+  },
+  surat_tugas: {
+    table: bucketTableMap.surat_tugas,
+    fromDb: (row) => ({
+      "Kode Pengajar": asString(row.kode_pengajar),
+      Tanggal: asString(row.tanggal),
+      "Sesi 1": asString(row.sesi_1),
+      "Sesi 2": asString(row.sesi_2),
+      "Sesi 3": asString(row.sesi_3),
+      "Sesi 4": asString(row.sesi_4),
+      "Sesi 5": asString(row.sesi_5),
+      "Sesi 6": asString(row.sesi_6),
+      "Sesi 7": asString(row.sesi_7),
+      "Sesi 8": asString(row.sesi_8),
+      "Sesi 9": asString(row.sesi_9),
+      "Sesi 10": asString(row.sesi_10),
+    }),
+    toDb: (data) => ({
+      kode_pengajar: asString(data["Kode Pengajar"]),
+      tanggal: normalizeDbDate(data.Tanggal),
+      sesi_1: asString(data["Sesi 1"]),
+      sesi_2: asString(data["Sesi 2"]),
+      sesi_3: asString(data["Sesi 3"]),
+      sesi_4: asString(data["Sesi 4"]),
+      sesi_5: asString(data["Sesi 5"]),
+      sesi_6: asString(data["Sesi 6"]),
+      sesi_7: asString(data["Sesi 7"]),
+      sesi_8: asString(data["Sesi 8"]),
+      sesi_9: asString(data["Sesi 9"]),
+      sesi_10: asString(data["Sesi 10"]),
+    }),
+  },
+  libur_nasional: {
+    table: "libur_nasional",
+    fromDb: (row) => ({
+      ID: asString(row.id),
+      Tanggal: asString(row.tanggal),
+      Keterangan: asString(row.keterangan_libur),
+      CreatedAt: asString(row.created_at),
+      UpdatedAt: asString(row.updated_at),
+    }),
+    toDb: (data) => ({
+      id: asString(data.ID),
+      tanggal: normalizeDbDate(data.Tanggal),
+      keterangan_libur: asString(data.Keterangan),
+      created_at: asString(data.CreatedAt || new Date().toISOString()),
+      updated_at: new Date().toISOString(),
+    }),
+  },
+  penempatan_pengajar_dicabang: {
+    table: bucketTableMap.penempatan_pengajar_dicabang,
+    fromDb: (row) => {
+      const raw = row as Record<string, unknown>;
+      return {
+        "Kode Pengajar": asString(raw.kode_pengajar),
+        "Nama Pengajar": asString(raw.nama_pengajar),
+        Domisili: asString(raw.domisili),
+        Hari: asString(raw.hari_tersedia),
+        "Jam Mulai": asString(raw.jam_mulai),
+        "Jam Selesai": asString(raw.jam_selesai),
+        "Cabang Penempatan": asString(raw.bersedia_mengajar_dicabang),
+        "__id_pengajar": asString(raw.id_pengajar),
+      };
+    },
+    toDb: (data) => {
+      const rawData = data as Record<string, unknown>;
+      const hariTersedia = asString(rawData.Hari ?? rawData.hari_tersedia);
+      const jamMulai = asString(rawData["Jam Mulai"] ?? rawData.jam_mulai);
+      const jamSelesai = asString(rawData["Jam Selesai"] ?? rawData.jam_selesai);
+      const cabangPenempatan = asString(rawData["Cabang Penempatan"] ?? rawData.bersedia_mengajar_dicabang);
+
+      return {
+        id_pengajar: asString(rawData["__id_pengajar"] ?? rawData.id_pengajar),
+        kode_pengajar: asString(rawData["Kode Pengajar"] ?? rawData.kode_pengajar),
+        nama_pengajar: asString(rawData["Nama Pengajar"] ?? rawData.nama_pengajar),
+        domisili: asString(rawData.Domisili ?? rawData.domisili),
+        hari_tersedia: hariTersedia,
+        jam_mulai: jamMulai,
+        jam_selesai: jamSelesai,
+        bersedia_mengajar_dicabang: cabangPenempatan,
+      };
+    },
+  },
+  izin_pengajar: {
+    table: bucketTableMap.izin_pengajar,
+    fromDb: (row) => ({
+      ID: asString(row.id),
+      "Kode Pengajar": asString(row.kode_pengajar),
+      "Nama Pengajar": asString(row.nama_pengajar),
+      Domisili: asString(row.domisili),
+      "Cabang Target": asString(row.cabang_target),
+      "Tanggal Mulai": asString(row.tanggal_mulai),
+      "Tanggal Selesai": asString(row.tanggal_selesai),
+      Keterangan: asString(row.keterangan),
+      "Keterangan Status": asString(row.status ?? row.keterangan_status),
+      "Diputuskan Oleh": asString(row.diputuskan_oleh),
+      "Diputuskan Pada": asString(row.diputuskan_pada),
+    }),
+    toDb: (data) => ({
+      kode_pengajar: asString(data["Kode Pengajar"]),
+      nama_pengajar: asString(data["Nama Pengajar"]),
+      domisili: asString(data.Domisili),
+      cabang_target: asString(data["Cabang Target"]),
+      tanggal_mulai: normalizeDbDate(data["Tanggal Mulai"]),
+      tanggal_selesai: normalizeDbDate(data["Tanggal Selesai"]),
+      keterangan: asString(data.Keterangan),
+      status: asString(data["Status"] || data["Keterangan Status"] || "Menunggu"),
+      diputuskan_oleh: asString(data["Diputuskan Oleh"]),
+      diputuskan_pada: asTimestampOrNull(
+        data["Diputuskan Pada Raw"] || data["Diputuskan Pada"]
+      ),
+    }),
+  },
+  permintaan_pengajar: {
+    table: bucketTableMap.permintaan_pengajar,
+    fromDb: (row) => ({
+      ID: asString(row.id),
+      "Kode Pengajar": asString(row.kode_pengajar),
+      "Nama Pengajar": asString(row.nama_pengajar),
+      "Dari Cabang": asString(row.dari_cabang),
+      "Cabang Peminta": asString(row.cabang_peminta),
+      "Tanggal Diminta": asString(row.tanggal_diminta),
+      "Jam Mulai": asString(row.jam_mulai),
+      "Jam Selesai": asString(row.jam_selesai),
+      Status: asString(row.status),
+      Catatan: asString(row.catatan),
+      "Created At": asString(row.created_at),
+      "Updated At": asString(row.updated_at),
+    }),
+    toDb: (data) => ({
+      kode_pengajar: asString(data["Kode Pengajar"]),
+      nama_pengajar: asString(data["Nama Pengajar"]),
+      dari_cabang: asString(data["Dari Cabang"]),
+      cabang_peminta: asString(data["Cabang Peminta"]),
+      tanggal_diminta: normalizeDbDate(data["Tanggal Diminta"]),
+      jam_mulai: asString(data["Jam Mulai"]),
+      jam_selesai: asString(data["Jam Selesai"]),
+      status: asString(data.Status || "Menunggu"),
+      catatan: asString(data.Catatan),
+    }),
+  },
+  riwayat_notifikasi_pengajar: {
+    table: bucketTableMap.riwayat_notifikasi_pengajar,
+    fromDb: (row) => ({
+      ID: asString(row.id),
+      "Kode Pengajar": asString(row.kode_pengajar),
+      "Nama Pengajar": asString(row.nama_pengajar),
+      "Tipe Notifikasi": asString(row.tipe_notifikasi),
+      Pesan: asString(row.pesan),
+      "Status Baca": String(asNumberOrNull(row.status_baca) || 0),
+      "Created At": asString(row.created_at),
+      "Jumlah Pengiriman": String(asNumberOrNull(row.jumlah_pengiriman) || 0),
+      "Pengiriman Terakhir At": asString(row.pengiriman_terakhir_at),
+    }),
+    toDb: (data) => ({
+      id: asString(data.ID),
+      kode_pengajar: asString(data["Kode Pengajar"]),
+      nama_pengajar: asString(data["Nama Pengajar"]),
+      tipe_notifikasi: asString(data["Tipe Notifikasi"]),
+      pesan: asString(data.Pesan),
+      status_baca: Number(data["Status Baca"] || 0),
+      created_at: asString(data["Created At"] || new Date().toISOString()),
+      jumlah_pengiriman: Number(data["Jumlah Pengiriman"] || 0),
+      pengiriman_terakhir_at: asString(data["Pengiriman Terakhir At"]) || null,
+    }),
+  },
+};
+
+const normalizeData = (value: unknown) => {
+  if (!value || typeof value !== "object") {
+    return {} as Record<string, string>;
+  }
+
+  return Object.entries(value as Record<string, unknown>).reduce<Record<string, string>>(
+    (acc, [key, item]) => {
+      acc[key] = item === undefined || item === null ? "" : String(item);
+      return acc;
+    },
+    {}
+  );
+};
+
+const inFlightTableRequests = new Map<string, Promise<any[]>>();
+
+// Real-time BroadcastChannel for instantaneous zero-CPU cross-tab and in-tab synchronization
+let realtimeBroadcastChannel: BroadcastChannel | null = null;
+try {
+  if (typeof window !== "undefined" && "BroadcastChannel" in window) {
+    realtimeBroadcastChannel = new BroadcastChannel("kbm_realtime_sync");
+    realtimeBroadcastChannel.onmessage = (event) => {
+      const data = event?.data;
+      if (data && data.bucket) {
+        if (typeof window !== "undefined") {
+          window.dispatchEvent(new CustomEvent("kbm_data_mutated", { detail: data }));
+        }
+      }
+    };
+  }
+} catch {
+  realtimeBroadcastChannel = null;
+}
+
+export const broadcastDataChange = (bucket: string, action = "mutation") => {
+  const payload = { bucket, action, timestamp: Date.now() };
+  if (realtimeBroadcastChannel) {
+    try {
+      realtimeBroadcastChannel.postMessage(payload);
+    } catch {}
+  }
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new CustomEvent("kbm_data_mutated", { detail: payload }));
+  }
+};
+
+export const clearAllReadCache = () => {
+  inFlightTableRequests.clear();
+  if (typeof window !== "undefined" && window.localStorage) {
+    try {
+      for (const bucket of Object.keys(bucketTableMap)) {
+        window.localStorage.removeItem(`kbm_cache_${bucket}`);
+      }
+      window.localStorage.removeItem("kbm_read_cache_v1");
+    } catch (_error) {
+      // Ignore localStorage error
+    }
+  }
+};
+
+export const invalidateReadCacheForBucket = (bucket: string) => {
+  // Broadcast real-time change to all listeners & open tabs
+  broadcastDataChange(bucket);
+};
+
+const apiRequest = async <T>(path: string, method: string = "GET", body?: unknown) => {
+  const init: RequestInit = { method };
+  if (body !== undefined) {
+    init.headers = { "Content-Type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+
+  return apiFetch<T>(path, init);
+};
+
+const getDbRow = async (table: string, rawId: string) => {
+  return apiRequest<Record<string, unknown>>(`/db/${table}/${encodeURIComponent(rawId)}`);
+};
+
+export const listRows = async (bucket: string, forceFresh = false) => {
+  if (!(bucket in schemas)) {
+    throw new Error(`Bucket tidak dikenal: ${bucket}`);
+  }
+
+  const schema = schemas[bucket as BucketName];
+  const table = schema.table;
+
+  // In-flight deduplication: reuse in-flight fetch for the same underlying table
+  let inFlight = inFlightTableRequests.get(table);
+  if (!inFlight) {
+    inFlight = apiRequest<any[]>(`/db/${table}`).finally(() => {
+      inFlightTableRequests.delete(table);
+    });
+    inFlightTableRequests.set(table, inFlight);
+  }
+
+  const data = await inFlight;
+
+  const rows = (data || []).map((row) => ({
+    id: encodeId(bucket, String(row.id || "")),
+    data: normalizeData(schema.fromDb(row as Record<string, unknown>)),
+    createdAt: asString((row as Record<string, unknown>).created_at),
+    updatedAt: asString((row as Record<string, unknown>).updated_at),
+  })) as DbRow[];
+
+  const filteredRows =
+    bucket === "jadwal_reguler"
+      ? rows.filter((row) => {
+          const raw = normalizeValueKey(row.data["Jenis KBM"] || row.data.jenis_kbm || "");
+          return raw === "reguler" || raw === "";
+        })
+      : bucket === "jadwal_khusus"
+        ? rows.filter((row) => normalizeValueKey(row.data["Jenis KBM"] || row.data.jenis_kbm || "") === "khusus")
+        : rows;
+
+  return filteredRows;
+};
+
+export const listRowsFiltered = async (bucket: string, filters: Record<string, string | number | boolean>) => {
+  if (!(bucket in schemas)) {
+    throw new Error(`Bucket tidak dikenal: ${bucket}`);
+  }
+
+  const schema = schemas[bucket as BucketName];
+  const table = schema.table;
+
+  // Build query string from filters
+  const params = new URLSearchParams();
+  Object.entries(filters).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") {
+      params.append(key, String(value));
+    }
+  });
+
+  const queryString = params.toString();
+  const url = `/db/${table}${queryString ? `?${queryString}` : ""}`;
+  
+  const data = await apiRequest<any[]>(url);
+
+  const rows = (data || []).map((row) => ({
+    id: encodeId(bucket, String(row.id || "")),
+    data: normalizeData(schema.fromDb(row as Record<string, unknown>)),
+    createdAt: asString((row as Record<string, unknown>).created_at),
+    updatedAt: asString((row as Record<string, unknown>).updated_at),
+  })) as DbRow[];
+
+  // Handle virtual buckets for jadwal
+  if (bucket === "jadwal_reguler") {
+    return rows.filter((row) => {
+      const raw = (row.data["Jenis KBM"] || row.data.jenis_kbm || "").toLowerCase();
+      return raw === "reguler" || raw === "";
+    });
+  } else if (bucket === "jadwal_khusus") {
+    return rows.filter((row) => (row.data["Jenis KBM"] || row.data.jenis_kbm || "").toLowerCase() === "khusus");
+  }
+
+  return rows;
+};
+
+export const insertRow = async (bucket: string, data: Record<string, string>) => {
+  if (!(bucket in schemas)) {
+    throw new Error(`Bucket tidak dikenal: ${bucket}`);
+  }
+  const schema = schemas[bucket as BucketName];
+  const inserted = await apiRequest<Record<string, unknown>>(
+    `/db/${schema.table}`,
+    "POST",
+    schema.toDb(data)
+  );
+
+  invalidateReadCacheForBucket(bucket);
+
+  return {
+    id: encodeId(bucket, String(inserted.id || "")),
+    data: normalizeData(schema.fromDb(inserted)),
+  } as DbRow;
+};
+
+export const updateRow = async (id: string, data: Record<string, string>) => {
+  const { bucket, id: rawId } = decodeId(id);
+  const schema = schemas[bucket];
+  const existing = await getDbRow(schema.table, rawId);
+
+  const mergedInput = {
+    ...normalizeData(schema.fromDb(existing as Record<string, unknown>)),
+    ...normalizeData(data),
+  };
+
+  const updated = await apiRequest<Record<string, unknown>>(
+    `/db/${schema.table}/${encodeURIComponent(rawId)}`,
+    "PUT",
+    schema.toDb(mergedInput)
+  );
+
+  invalidateReadCacheForBucket(bucket);
+
+  return {
+    id: encodeId(bucket, String(updated.id || "")),
+    data: normalizeData(schema.fromDb(updated)),
+  } as DbRow;
+};
+
+export const deleteRowsByIds = async (ids: string[]) => {
+  if (ids.length === 0) {
+    return;
+  }
+
+  const grouped = ids.reduce<Record<string, string[]>>((acc, id) => {
+    try {
+      const decoded = decodeId(id);
+      if (!decoded.id) return acc;
+      // Skip ephemeral client-side generated IDs
+      if (
+        decoded.id.startsWith("bulanIni-") ||
+        decoded.id.startsWith("jadwalTambahanPelayanan-") ||
+        decoded.id.startsWith("appscript-")
+      ) {
+        return acc;
+      }
+      if (!acc[decoded.bucket]) {
+        acc[decoded.bucket] = [];
+      }
+      acc[decoded.bucket].push(decoded.id);
+    } catch (_e) {
+      // ignore
+    }
+    return acc;
+  }, {});
+
+  for (const [bucket, rawIds] of Object.entries(grouped)) {
+    const schema = schemas[bucket as BucketName];
+    // Chunk ids to avoid SQLite D1 parameter limits
+    const chunkSize = 50;
+    for (let i = 0; i < rawIds.length; i += chunkSize) {
+      const chunk = rawIds.slice(i, i + chunkSize);
+      await apiRequest(`/db/${schema.table}/delete`, "POST", { ids: chunk });
+    }
+    invalidateReadCacheForBucket(bucket);
+  }
+};
+
+export const replaceBucketRows = async (bucket: string, records: Record<string, string>[]) => {
+  if (!(bucket in schemas)) {
+    throw new Error(`Bucket tidak dikenal: ${bucket}`);
+  }
+  const schema = schemas[bucket as BucketName];
+  const existing = await listRows(bucket);
+  await deleteRowsByIds(existing.map((row) => row.id));
+  if (records.length === 0) {
+    return;
+  }
+
+  const payload = records.map((record) => schema.toDb(record));
+  // Chunk payload to avoid SQLite D1 parameter limits
+  const chunkSize = 40;
+  for (let i = 0; i < payload.length; i += chunkSize) {
+    const chunk = payload.slice(i, i + chunkSize);
+    await apiRequest(`/db/${schema.table}/replace`, "POST", { rows: chunk });
+  }
+  invalidateReadCacheForBucket(bucket);
+};
